@@ -82,12 +82,36 @@ _EAPI_4_5_INTERNAL_BREAKER_CONFIG = CircuitBreakerConfig(
     half_open_max_calls=5,
     excluded_exceptions=(asyncio.CancelledError,),
 )
+_EAPI_4_6_INTERNAL_BREAKER_CONFIG = CircuitBreakerConfig(
+    failure_rate_threshold=0.5,
+    window_size=600.0,
+    min_calls_in_window=10,
+    recovery_timeout=600.0,
+    half_open_max_calls=5,
+    excluded_exceptions=(asyncio.CancelledError,),
+)
+_EAPI_4_5_X_ALGO_BREAKER_CONFIG = CircuitBreakerConfig(
+    failure_rate_threshold=0.5,
+    window_size=600.0,
+    min_calls_in_window=10,
+    recovery_timeout=600.0,
+    half_open_max_calls=5,
+    excluded_exceptions=(asyncio.CancelledError,),
+)
 _eapi_4_3_x_algo_breaker = CircuitBreaker(
     ModelName.EAPI_GROK_4_3_X_ALGO, _EAPI_4_3_X_ALGO_BREAKER_CONFIG
 )
 _eapi_4_5_internal_breaker = CircuitBreaker(
     ModelName.EAPI_GROK_4_5_INTERNAL, _EAPI_4_5_INTERNAL_BREAKER_CONFIG
 )
+_eapi_4_5_x_algo_breaker = CircuitBreaker(
+    ModelName.EAPI_GROK_4_5_X_ALGO, _EAPI_4_5_X_ALGO_BREAKER_CONFIG
+)
+_eapi_4_6_internal_breaker = CircuitBreaker(
+    ModelName.EAPI_GROK_4_6_INTERNAL, _EAPI_4_6_INTERNAL_BREAKER_CONFIG
+)
+
+_GROK_4_6_INTERNAL_DIAL = 0.3
 
 
 class SafetyPtosCategoryClassifier:
@@ -178,6 +202,10 @@ class SafetyPtosChildSafetyPolicyClassifier:
         self.oai_gemma4 = OaiSampler(grox_config.get_oai_model(gemma_model_name))
         eapi_cfg = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_INTERNAL)
         self.eapi_4_5_internal = EapiSampler(EapiModelConfig(**eapi_cfg.model_dump()))
+        eapi_cfg_4_6 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_6_INTERNAL)
+        self.eapi_4_6_internal = EapiSampler(
+            EapiModelConfig(**eapi_cfg_4_6.model_dump())
+        )
 
     def build_convo(self, post: Post) -> Conversation:
         post_creation_time = (
@@ -248,12 +276,18 @@ class SafetyPtosChildSafetyPolicyClassifier:
     async def _cross_model_validate_with_4_5(
         self, convo: Conversation, policy: SafetyPolicy, post_id: str
     ) -> SafetyPolicy:
-        metric = "safety_ptos.cross_model_validate_with_grok_4_5"
+        metric = "safety_ptos.child_safety_cross_model_validate_with_grok_4_5"
         try:
-            async with _eapi_4_5_internal_breaker.guard():
-                raw = await self.eapi_4_5_internal.sample(
-                    convo.interleaveToEapi(), conversation_id=convo.conversation_id
-                )
+            if random.random() < _GROK_4_6_INTERNAL_DIAL:
+                async with _eapi_4_6_internal_breaker.guard():
+                    raw = await self.eapi_4_6_internal.sample(
+                        convo.interleaveToEapi(), conversation_id=convo.conversation_id
+                    )
+            else:
+                async with _eapi_4_5_internal_breaker.guard():
+                    raw = await self.eapi_4_5_internal.sample(
+                        convo.interleaveToEapi(), conversation_id=convo.conversation_id
+                    )
             confirm = self._parse_policy(raw)
             if confirm is None:
                 logger.error(
@@ -318,6 +352,13 @@ class SafetyPtosPolicyClassifier:
             )
             self.eapi_4_5_internal = EapiSampler(
                 EapiModelConfig(**eapi_config_4_5_internal.model_dump())
+            )
+
+            eapi_config_4_6_internal = grox_config.get_eapi_model(
+                ModelName.EAPI_GROK_4_6_INTERNAL
+            )
+            self.eapi_4_6_internal = EapiSampler(
+                EapiModelConfig(**eapi_config_4_6_internal.model_dump())
             )
 
     @staticmethod
@@ -433,8 +474,12 @@ class SafetyPtosPolicyClassifier:
             and violation.category in self.DELUXE_4_3_CATEGORIES
         ):
             if fav_count >= 1024:
-                mode = "deluxe-4.5-internal"
-                result = await self._sample_4_5_internal(convo)
+                if random.random() < _GROK_4_6_INTERNAL_DIAL:
+                    mode = "deluxe-4.6-internal"
+                    result = await self._sample_4_6_internal(convo)
+                else:
+                    mode = "deluxe-4.5-internal"
+                    result = await self._sample_4_5_internal(convo)
             else:
                 mode = "deluxe-4.3"
                 result = await self._sample_4_3(convo)
@@ -523,6 +568,31 @@ class SafetyPtosPolicyClassifier:
             convo.interleave(), conversation_id=convo.conversation_id
         )
 
+    async def _sample_4_6_internal(self, convo: Conversation) -> str:
+        breaker, sampler = _eapi_4_6_internal_breaker, self.eapi_4_6_internal
+        try:
+            async with breaker.guard():
+                return await sampler.sample(
+                    convo.interleaveToEapi(), conversation_id=convo.conversation_id
+                )
+        except CircuitBreakerOpen as e:
+            Metrics.counter("safety_ptos.eapi_4_6_fallback.count").add(
+                1, attributes={"endpoint": breaker.name, "reason": "breaker_open"}
+            )
+            logger.warning(
+                f"4.6 circuit breaker '{e.name}' open (recovery in {e.remaining_seconds:.0f}s), falling back to 4.1"
+            )
+        except Exception:
+            Metrics.counter("safety_ptos.eapi_4_6_fallback.count").add(
+                1, attributes={"endpoint": breaker.name, "reason": "error"}
+            )
+            logger.error(
+                f"Failed to call 4.6-internal reasoning, conversation_id={convo.conversation_id}, error: {traceback.format_exc()}"
+            )
+        return await self.llm.sample(
+            convo.interleave(), conversation_id=convo.conversation_id
+        )
+
     async def _sample(self, convo: Conversation, sample_for_gemma: bool = False) -> str:
         if (
             sample_for_gemma
@@ -541,3 +611,46 @@ class SafetyPtosPolicyClassifier:
         return await self.llm.sample(
             convo.interleave(), conversation_id=convo.conversation_id
         )
+
+
+class SafetyPtosAdultContentCrossValidationJudge:
+    result_pattern = re.compile(r"(.*)<json>(.*)</json>", re.DOTALL)
+
+    def __init__(self):
+        eapi_cfg = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)
+        self.llm = EapiSampler(EapiModelConfig(**eapi_cfg.model_dump()))
+
+    def build_convo(self, post: Post) -> Conversation:
+        convo = Conversation(conversation_id=uuid.uuid4().hex)
+        convo.messages.append(
+            Message(
+                role=Role.SYSTEM,
+                content=[_strip_thinking_restrictions(adult_content_policy_prompt())],
+            )
+        )
+
+        user_msg = Message(role=Role.USER, content=[])
+        user_msg.content.extend(UserRenderer.render(post.user))
+        user_msg.content.extend(PostRenderer.render(post, include_reply_to=True))
+        user_msg.content.append(
+            f"\n\nAnalyze the post {post.id} for the specific safety policy violation category: {SafetyPolicyCategory.AdultContent.value}"
+        )
+        user_msg.content.append(
+            f"\n\nProvide the requested JSON object for the specific safety policy type.{THINKING_CONTROL_START}"
+        )
+        convo.messages.append(user_msg)
+        convo.messages.append(Message(role=Role.ASSISTANT, content=[]))
+        return convo
+
+    async def judge(self, post: Post) -> SafetyPolicy:
+        convo = self.build_convo(post)
+        async with _eapi_4_5_x_algo_breaker.guard():
+            raw = await self.llm.sample(
+                convo.interleaveToEapi(), conversation_id=convo.conversation_id
+            )
+        match = self.result_pattern.search(raw)
+        if not match:
+            raise ValueError(
+                f"Invalid output for adult content cross validation judge: {raw[:500]!r}"
+            )
+        return SafetyPolicy.model_validate_json(match.group(2).strip())

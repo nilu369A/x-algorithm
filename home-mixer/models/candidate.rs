@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub use xai_candidate_pipeline::component_library::models::PhoenixScores;
 use xai_home_mixer_proto as pb;
+use xai_recsys_proto::SAFETY_BIT_AUTHOR_NSFW;
 use xai_visibility_filtering::models as vf;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub struct PostCandidate {
     pub score: Option<f64>,
     pub slate_context: Option<SlateContext>,
     #[serde(default)]
+    pub served_slate_context: Option<SlateContext>,
+    #[serde(default)]
     pub mpn_parts: Option<MpnParts>,
     #[serde(
         serialize_with = "serialize_served_type",
@@ -32,6 +35,8 @@ pub struct PostCandidate {
     pub ancestors: Vec<u64>,
     pub tombstone_ancestor_ids: Vec<u64>,
     pub ancestor_users: Vec<u64>,
+    pub ancestor_texts: HashMap<u64, String>,
+    pub quoted_tweet_text: Option<String>,
     pub min_video_duration_ms: Option<i32>,
     pub quoted_video_duration_ms: Option<i32>,
     pub author_followers_count: Option<i32>,
@@ -62,6 +67,7 @@ pub struct PostCandidate {
     pub brand_safety_verdict: Option<BrandSafetyVerdict>,
     pub nsfw_author: Option<bool>,
     pub nsfw_author_ads: Option<bool>,
+    pub nsfw_author_phoenix: Option<bool>,
     #[serde(default)]
     pub safety_labels: Vec<SafetyLabelInfo>,
     #[serde(default)]
@@ -69,15 +75,44 @@ pub struct PostCandidate {
     pub topic_feedback_topic: Option<String>,
     pub topic_feedback_topic_id: Option<String>,
     pub grok_topics: Option<Vec<String>>,
+    pub ai_trend_name: Option<String>,
+    pub ai_trend_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SlateContext {
     pub k: u32,
     pub pool_rank: u32,
     pub pool_rank_gap: Option<u32>,
     pub fatigue: f64,
     pub pre_diversity_score: f64,
+    pub sid_known: bool,
+    pub sid_k_l1: u32,
+    pub sid_k_l2: u32,
+    pub sid_k_l3: u32,
+    pub sid_gap_l1: Option<u32>,
+    pub sid_gap_l2: Option<u32>,
+    pub sid_gap_l3: Option<u32>,
+}
+
+impl From<xai_recsys_proto::SlateContext> for SlateContext {
+    fn from(c: xai_recsys_proto::SlateContext) -> Self {
+        Self {
+            k: c.k,
+            pool_rank: c.pool_rank,
+            pool_rank_gap: c.pool_rank_gap,
+            fatigue: c.fatigue,
+            pre_diversity_score: c.pre_diversity_score,
+            sid_known: c.sid_known,
+            sid_k_l1: c.sid_k1,
+            sid_k_l2: c.sid_k2,
+            sid_k_l3: c.sid_k3,
+            sid_gap_l1: c.sid_gap1,
+            sid_gap_l2: c.sid_gap2,
+            sid_gap_l3: c.sid_gap3,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -159,6 +194,13 @@ impl CandidateHelpers for PostCandidate {
                 pool_rank_gap: c.pool_rank_gap,
                 fatigue: c.fatigue,
                 pre_diversity_score: c.pre_diversity_score,
+                sid_known: c.sid_known,
+                sid_k1: c.sid_k_l1,
+                sid_k2: c.sid_k_l2,
+                sid_k3: c.sid_k_l3,
+                sid_gap1: c.sid_gap_l1,
+                sid_gap2: c.sid_gap_l2,
+                sid_gap3: c.sid_gap_l3,
             }),
             reward_rerank_slot_prob: None,
         }
@@ -182,6 +224,13 @@ impl CandidateHelpers for PostCandidate {
             quoted_author_id: self.quoted_user_id.unwrap_or(0),
             in_reply_to_tweet_id: self.in_reply_to_tweet_id.unwrap_or(0),
             is_author_followed_by_user: is_followed_by_viewer,
+            safety_label_mask: if self.retweeted_user_id.is_none()
+                && self.nsfw_author_phoenix.unwrap_or(false)
+            {
+                SAFETY_BIT_AUTHOR_NSFW
+            } else {
+                0
+            },
             min_video_duration_ms: self.min_video_duration_ms.map(|ms| ms as u64).unwrap_or(0),
             fav_count: self.fav_count.unwrap_or(0) as u64,
             retweet_count: self.repost_count.unwrap_or(0) as u64,
@@ -207,7 +256,11 @@ impl CandidateHelpers for PostCandidate {
                 } else {
                     None
                 },
-                ..Default::default()
+                followers: if self.retweeted_user_id.is_none() {
+                    self.author_followers_count.map(|c| c.max(0) as u64)
+                } else {
+                    None
+                },
             }),
             semantic_ids: self.semantic_ids.clone().unwrap_or_default(),
             ..Default::default()

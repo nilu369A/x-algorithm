@@ -1171,36 +1171,6 @@ impl pb::recsys_predictor_server::RecsysPredictor for RecsysPredictorImpl {
     }
 }
 
-fn fill_semantic_ids(
-    sids: &std::collections::HashMap<i64, Vec<i32>>,
-    post_ids: &[i64],
-    dst: &mut [u16],
-    sid_dim: usize,
-) {
-    for (j, &post_id) in post_ids.iter().enumerate() {
-        if post_id == 0 {
-            continue;
-        }
-        if let Some(codes) = sids.get(&post_id) {
-            assert_eq!(
-                codes.len(),
-                sid_dim,
-                "SID codes length ({}) != sid_num_levels ({}) for post_id {}",
-                codes.len(),
-                sid_dim,
-                post_id,
-            );
-            let dst_start = j * sid_dim;
-            for (d, &c) in dst[dst_start..dst_start + sid_dim]
-                .iter_mut()
-                .zip(codes.iter())
-            {
-                *d = (c + 1) as u16;
-            }
-        }
-    }
-}
-
 async fn handle_request(
     candidate_set: CandidateSet,
     sequence: Option<UserActionSequence>,
@@ -2751,6 +2721,7 @@ struct RecsysRetrievalPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
+    #[allow(dead_code)]
     sid_client: Option<Arc<crate::sid_client::SemanticIdClient>>,
     admission: Arc<AdmissionController>,
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
@@ -2870,7 +2841,6 @@ impl RecsysRetrievalPredictorImpl {
             &self.model_config,
             &cancel_token,
             self.enqueue_timeout_ms,
-            &self.sid_client,
             request.client_context,
             request.user_context,
             deadline,
@@ -2975,7 +2945,6 @@ async fn handle_retrieval_request(
     model_config: &ModelConfig,
     cancellation_token: &CancellationToken,
     enqueue_timeout_ms: u64,
-    sid_client: &Option<Arc<crate::sid_client::SemanticIdClient>>,
     client_context: Option<pb::ClientContext>,
     user_context: Option<pb::UserContext>,
     deadline: Option<Instant>,
@@ -2990,7 +2959,7 @@ async fn handle_retrieval_request(
         .unwrap_or("");
 
     let start = std::time::Instant::now();
-    let mut input_buffer = if let Some(ref columnar_bytes) = columnar_sequence_bytes {
+    let input_buffer = if let Some(ref columnar_bytes) = columnar_sequence_bytes {
         log::debug!(
             "Computing retrieval input buffer from columnar bytes ({} bytes)",
             columnar_bytes.len()
@@ -3028,25 +2997,6 @@ async fn handle_retrieval_request(
             user_context.as_ref(),
         )
     };
-
-    let sid_num_levels = model_config.sid_num_levels;
-    if sid_num_levels > 0
-        && let Some(client) = sid_client.as_ref()
-    {
-        let history_ids: Vec<i64> = input_buffer
-            .history_post_ids
-            .iter()
-            .copied()
-            .filter(|&id| id != 0)
-            .collect();
-        let sids = client.lookup(&history_ids).await;
-        fill_semantic_ids(
-            &sids,
-            &input_buffer.history_post_ids,
-            &mut input_buffer.history_semantic_ids,
-            sid_num_levels,
-        );
-    }
 
     let duration = start.elapsed();
     INPUT_BUFFER_COMPUTATION_TIME.observe(duration.as_secs_f64());
@@ -3168,6 +3118,7 @@ macro_rules! server_impl {
                         num_post_bool_features = 0,
                         num_post_float_features = 0,
                         num_post_int64_features = 0,
+                        enable_stale_post = false,
                         enable_async_response_compression = false,
                         sid_num_levels = 0,
                         copy_max_entries = DEFAULT_MAX_ENTRIES,
@@ -3232,6 +3183,7 @@ macro_rules! server_impl {
                         num_post_bool_features: usize,
                         num_post_float_features: usize,
                         num_post_int64_features: usize,
+                        enable_stale_post: bool,
                         enable_async_response_compression: bool,
                         sid_num_levels: usize,
                         #[allow(unused_variables)]
@@ -3317,6 +3269,7 @@ macro_rules! server_impl {
                             num_post_bool_features,
                             num_post_float_features,
                             num_post_int64_features,
+                            enable_stale_post,
                         );
                         internal_model_config.sid_num_levels = sid_num_levels;
                         let reload_request = Arc::new(AtomicBool::new(false));
