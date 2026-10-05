@@ -41,7 +41,6 @@ from xai_checkpointing import checksum
 from xai_checkpointing import common as checkpointing_common
 from xai_checkpointing import load as checkpointing_load
 from xai_checkpointing.tree_util import tree_to_dict
-
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.recsys_model import RecsysAggregatedModelConfig
 from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig
@@ -243,6 +242,13 @@ class Trainer(Config):
         init=False, repr=False, compare=False, default=lambda *_a, **_kw: 1.0
     )
     current_ckpt_index: int = field(init=False, repr=False, compare=False, default=0)
+
+    @property
+    def step(self) -> int:
+        state = self.state[0] if isinstance(self.state, list) else self.state
+        step = state.step + 0
+        step = step.item()
+        return step
 
     data_first_read_timeout = 60
     data_read_timeout = 30
@@ -722,9 +728,10 @@ class Trainer(Config):
         if jax.default_backend() != "gpu":
             host_memory_kind = "unpinned_host"
 
-        self.host_sharding = self.adjust_host_sharding(
-            jax.tree.map(lambda s: s.with_memory_kind(host_memory_kind), self.state_sharding)
+        self.reload_host_sharding = jax.tree.map(
+            lambda s: s.with_memory_kind(host_memory_kind), self.state_sharding
         )
+        self.host_sharding = self.adjust_host_sharding(self.reload_host_sharding)
 
         def h2d_copy(src, dst):
             dst = jax.device_put(src, self.state_sharding)
@@ -736,8 +743,8 @@ class Trainer(Config):
         self.reload_state = JittedOrCompiled(
             jax.jit(
                 h2d_copy,
-                in_shardings=(self.host_sharding, self.state_sharding),
-                out_shardings=(self.host_sharding, self.state_sharding),
+                in_shardings=(self.reload_host_sharding, self.state_sharding),
+                out_shardings=(self.reload_host_sharding, self.state_sharding),
                 donate_argnums=(0, 1),
                 keep_unused=True,
             )
@@ -761,20 +768,6 @@ class Trainer(Config):
         self.register_jit_function(self.iden_jit, self.state_shape, phase="early")
 
         unwrapped_state_shape = unwrap_tree(self.state_shape)
-
-        def norm(tree):
-            return jax.tree.map(
-                lambda x: jnp.sqrt(jnp.sum(jnp.square(x.astype(jnp.float32)))), tree
-            )
-
-        self.norm_jit = JittedOrCompiled(
-            jax.jit(
-                norm,
-                in_shardings=(self.state_sharding,),
-                out_shardings=jax.sharding.NamedSharding(self.mesh, P()),
-            )
-        )
-        self.register_jit_function(self.norm_jit, unwrapped_state_shape, phase="early")
 
         def compute_checksums(state):
             return checksum.compute_checksums(state, self.state_sharding, self.mesh)
@@ -1153,6 +1146,18 @@ class Trainer(Config):
         rank_logger.info("Not loading optimizer state from checkpoint")
         return host_state.purge_opt_state()
 
+    def warm_start_staging_spec(self):
+        keep_fields = {"opt_state"}
+        if hasattr(self.state, "emb_table_state"):
+            keep_fields.add("emb_table_state")
+        return (lambda tree: tree.purge_opt_state()), keep_fields
+
+    def _uses_tensorstore_save(self) -> bool:
+        return self.checkpoint_config.save_method == "tensorstore"
+
+    def restore_checkpoint_arrays(self, path, arrays, load_mask, rename, tag, on_replaced):
+        return {}
+
     def maybe_load_checkpoint(
         self, ctx: TrainerContext, tag: str | None = None
     ) -> tuple[bool, int, int]:
@@ -1160,24 +1165,72 @@ class Trainer(Config):
             rank_logger.info("Not loading checkpoint; starting from scratch")
             return False, 0, 0
 
+        _src = Path(ctx.checkpoint.path)
+        self._restored_encrypted = any(
+            (p / "_DEK").exists() or checkpointing_load._is_encrypted_tree(p)
+            for p in (_src, _src / "orbax-ckpt")
+        )
+
+        do_not_load_opt_state = (
+            self.checkpoint_config.no_opt_state or self.reinit_on_load
+        ) and ctx.checkpoint.is_manual_load()
+
+        use_streamed_restore = (
+            self.checkpoint_config.restore_streamed
+            and ctx.checkpoint.format == "orbax"
+            and not self._uses_tensorstore_save()
+        )
+        if self.checkpoint_config.restore_streamed and not use_streamed_restore:
+            rank_logger.info(
+                "restore_streamed=True but falling back to whole-state staging "
+                "(format=%s, save_method=%s)",
+                ctx.checkpoint.format,
+                self.checkpoint_config.save_method,
+            )
+
+        if use_streamed_restore:
+            self.state = checkpointing_load.copy_aliased_arrays(self.state)
+
         restore_kind = next(
             k for k in jax.tree.leaves(jax.tree.map(lambda s: s.memory_kind, self.host_sharding))
         )
         restore_staging_sharding = jax.tree.map(
             lambda s: s.with_memory_kind(restore_kind), self.state_sharding
         )
-        self.host_state = jax.device_put(self.state, restore_staging_sharding)
+        warm_purge = None
+        warm_keep_fields: set[str] = set()
+        if do_not_load_opt_state and hasattr(self.state, "purge_opt_state"):
+            warm_purge, warm_keep_fields = self.warm_start_staging_spec()
+            rank_logger.info(
+                "Not loading optimizer state from checkpoint (params-only %s staging)",
+                "streamed" if use_streamed_restore else "pinned-host",
+            )
+            staged_state = warm_purge(self.state)
+            staged_sharding = warm_purge(restore_staging_sharding)
+        else:
+            do_not_load_opt_state = False
+            staged_state = self.state
+            staged_sharding = restore_staging_sharding
+
+        if use_streamed_restore:
+            self.host_state = None
+        else:
+            self.host_state = jax.device_put(staged_state, staged_sharding)
 
         rename = None
 
         loads: dict[str, dict[str, jax.Array]] = {}
+        independently_verified: dict[str, dict[str, int]] = {}
 
         if ctx.checkpoint.format == "orbax":
-            host_state = unwrap_tree(self.host_state)
-
-            do_not_load_opt_state = (
-                self.checkpoint_config.no_opt_state or self.reinit_on_load
-            ) and ctx.checkpoint.is_manual_load()
+            if use_streamed_restore:
+                host_state = jax.tree.map(
+                    lambda p: p.x if isinstance(p, Parameter) else p,
+                    staged_state,
+                    is_leaf=lambda x: isinstance(x, Parameter),
+                )
+            else:
+                host_state = unwrap_tree(self.host_state)
 
             if do_not_load_opt_state:
                 host_state = self.purge_opt_state_on_load(host_state)
@@ -1222,20 +1275,83 @@ class Trainer(Config):
                             name = checkpointing_load.rename_tensor(name, rename_state_patterns)
                             loads[checkpoint_path][name] = tensor
 
+            if use_streamed_restore:
+                del staged_state
+
+                def _graft_replaced(pairs: list[tuple[jax.Array, jax.Array]]) -> None:
+                    id_map = {id(old): new for old, new in pairs}
+                    assert len(id_map) == len(pairs), (
+                        "restore_streamed does not support aliased state leaves: "
+                        "multiple loaded tensors share one device array"
+                    )
+                    grafted: set[int] = set()
+
+                    def _graft(x):
+                        new = id_map.get(id(x))
+                        if new is None:
+                            return x
+                        grafted.add(id(x))
+                        return new
+
+                    self.state = jax.tree.map(_graft, self.state)
+                    missing = len(id_map) - len(grafted)
+                    assert not missing, (
+                        f"{missing} loaded tensors were not grafted back into the state tree"
+                    )
+
             for checkpoint_path, partial_host_state in loads.items():
-                checkpointing_load.load_checkpoint(
+                independently_verified[checkpoint_path] = self.restore_checkpoint_arrays(
                     checkpoint_path,
                     partial_host_state,
-                    load_mask=mask,
-                    rename=rename,
-                    domains=domains,
-                    tag=tag,
-                    timeout=self.checkpoint_config.timeout_secs,
+                    mask,
+                    rename,
+                    tag,
+                    _graft_replaced if use_streamed_restore else None,
                 )
+                if use_streamed_restore:
+                    checkpointing_load.load_checkpoint_streamed(
+                        checkpoint_path,
+                        partial_host_state,
+                        load_mask=mask,
+                        rename=rename,
+                        domains=domains,
+                        tag=tag,
+                        timeout=self.checkpoint_config.timeout_secs,
+                        window_gb=self.checkpoint_config.restore_window_gb,
+                        window_cap_gb=(
+                            self.checkpoint_config.restore_concurrent_gb
+                            if self.checkpoint_config.restore_window_gb is None
+                            else None
+                        ),
+                        on_replaced=_graft_replaced,
+                    )
+                else:
+                    checkpointing_load.load_checkpoint(
+                        checkpoint_path,
+                        partial_host_state,
+                        load_mask=mask,
+                        rename=rename,
+                        domains=domains,
+                        tag=tag,
+                        timeout=self.checkpoint_config.timeout_secs,
+                        concurrent_gb=self.checkpoint_config.restore_concurrent_gb,
+                    )
 
-            self.state = None
-            self.state = jax.device_put(self.host_state, self.state_sharding)
-            self.host_state = jax.device_put(self.state, self.host_sharding)
+            if not use_streamed_restore:
+                if do_not_load_opt_state:
+                    loaded = jax.device_put(self.host_state, warm_purge(self.state_sharding))
+                    self.state = self.state._replace(
+                        **{
+                            field: getattr(loaded, field)
+                            for field in self.state._fields
+                            if field not in warm_keep_fields
+                        }
+                    )
+                    self.host_state = None
+                else:
+                    staged_state = self.state = None
+                    self.state = jax.device_put(self.host_state, self.state_sharding)
+                    self.host_state = jax.device_put(self.state, self.host_sharding)
 
             if mask:
                 axes_sizes = {}
@@ -1275,6 +1391,13 @@ class Trainer(Config):
 
         if self.checkpoint_config.verify_checksums:
             checksum_dict = self.checksum_dict()
+            for expected in independently_verified.values():
+                checksum.check_internal_consistency(
+                    checksum_dict, "restored state", names=set(expected)
+                )
+                for name, value in expected.items():
+                    if checksum_dict["global_checksums"][name] != value:
+                        raise ValueError(f"Restored destination checksum mismatch for {name}")
 
         for i, (checkpoint_path, partial_host_state) in enumerate(loads.items()):
             restored_fields = set()
@@ -1316,7 +1439,8 @@ class Trainer(Config):
             if self.checkpoint_config.verify_checksums:
                 checksums_file = f"{checkpoint_path}/checksums.0.json"
                 try:
-                    if checksum.compare_checksum_dicts(
+                    verified = independently_verified.get(checkpoint_path, {})
+                    if (verified and not names) or checksum.compare_checksum_dicts(
                         checksums_file, checksum_dict, rename, names=names
                     ):
                         rank_logger.info("Checkpoint checksums match%s", extra0)

@@ -6,10 +6,10 @@ from typing import Optional, Sequence, Union
 import haiku as hk
 import jax
 import jax.numpy as jnp
-from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
 
 from xrex.models.model_utils import get_parameter
+from xrex.utils.sharding import with_sharding_constraint
 
 
 def rms_norm_fn(

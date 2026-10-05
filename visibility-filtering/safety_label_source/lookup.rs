@@ -6,6 +6,7 @@ use xai_visibility_filtering_proto as vf_pb;
 
 use super::metrics::{self, BatchStage};
 use super::types::{FailureKind, FallbackReason, LabelSource, ManhattanOutcome, TwemcacheOutcome};
+use super::warmer::Warmer;
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{kind:?}: {message}")]
@@ -38,6 +39,7 @@ pub(crate) trait ManhattanLookup: Send + Sync {
 pub(crate) struct RemoteSource {
     twemcache: Arc<dyn TwemcacheLookup>,
     manhattan: Arc<dyn ManhattanLookup>,
+    warmer: Option<Arc<dyn Warmer>>,
 }
 
 impl RemoteSource {
@@ -51,7 +53,13 @@ impl RemoteSource {
         Self {
             twemcache,
             manhattan,
+            warmer: None,
         }
+    }
+
+    pub(crate) fn with_warmer(mut self, warmer: Arc<dyn Warmer>) -> Self {
+        self.warmer = Some(warmer);
+        self
     }
 
     pub(crate) async fn get(&self, ids: &[u64]) -> LookupResults {
@@ -59,8 +67,12 @@ impl RemoteSource {
         let mut results = HashMap::with_capacity(ids.len());
         let mut fallback_ids = Vec::new();
         let mut fallback_counts: BTreeMap<FallbackReason, usize> = BTreeMap::new();
+        let mut warm_ids = Vec::new();
 
         for &tweet_id in ids {
+            if results.contains_key(&tweet_id) || fallback_ids.contains(&tweet_id) {
+                continue;
+            }
             match twemcache_results.remove(&tweet_id) {
                 Some(TwemcacheOutcome::Hit(label_map)) => {
                     results.insert(tweet_id, Ok(label_map));
@@ -75,6 +87,9 @@ impl RemoteSource {
                 }
                 Some(TwemcacheOutcome::Miss) => {
                     fallback_ids.push(tweet_id);
+                    if self.warmer.is_some() {
+                        warm_ids.push(tweet_id);
+                    }
                 }
                 Some(TwemcacheOutcome::FallThrough(reason)) => {
                     fallback_ids.push(tweet_id);
@@ -91,6 +106,12 @@ impl RemoteSource {
 
         for (reason, count) in fallback_counts {
             metrics::record_cache_fallback_keys(LabelSource::Twemcache, reason, count);
+        }
+
+        if let Some(warmer) = &self.warmer
+            && !warm_ids.is_empty()
+        {
+            warmer.warm(warm_ids);
         }
 
         metrics::record_batch_size(BatchStage::ManhattanFallback, fallback_ids.len());
@@ -126,26 +147,19 @@ mod tests {
 
     struct FakeTwemcache {
         results: Mutex<HashMap<u64, TwemcacheOutcome>>,
-        calls: Mutex<Vec<Vec<u64>>>,
     }
 
     impl FakeTwemcache {
         fn new(results: HashMap<u64, TwemcacheOutcome>) -> Arc<Self> {
             Arc::new(Self {
                 results: Mutex::new(results),
-                calls: Mutex::new(Vec::new()),
             })
-        }
-
-        fn calls(&self) -> Vec<Vec<u64>> {
-            self.calls.lock().unwrap().clone()
         }
     }
 
     #[async_trait]
     impl TwemcacheLookup for FakeTwemcache {
         async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome> {
-            self.calls.lock().unwrap().push(ids.to_vec());
             let mut results = self.results.lock().unwrap();
             ids.iter()
                 .filter_map(|id| results.remove(id).map(|result| (*id, result)))
@@ -182,6 +196,28 @@ mod tests {
         }
     }
 
+    struct FakeWarmer {
+        published: Mutex<Vec<Vec<u64>>>,
+    }
+
+    impl FakeWarmer {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                published: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn published(&self) -> Vec<Vec<u64>> {
+            self.published.lock().unwrap().clone()
+        }
+    }
+
+    impl Warmer for FakeWarmer {
+        fn warm(&self, miss_ids: Vec<u64>) {
+            self.published.lock().unwrap().push(miss_ids);
+        }
+    }
+
     fn empty_label_map() -> vf_pb::SafetyLabelMap {
         vf_pb::SafetyLabelMap {
             labels: HashMap::new(),
@@ -189,83 +225,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_cache_hit_skips_manhattan() {
-        let twemcache = FakeTwemcache::new(HashMap::from([(
-            42,
-            TwemcacheOutcome::Hit(empty_label_map()),
-        )]));
-        let manhattan = FakeManhattan::new(HashMap::new());
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
-
-        let results = source.get(&[42]).await;
-
-        assert!(results.get(&42).unwrap().is_ok());
-        assert_eq!(twemcache.calls(), vec![vec![42]]);
-        assert_eq!(manhattan.calls(), vec![Vec::<u64>::new()]);
-    }
-
-    #[tokio::test]
-    async fn get_cache_miss_falls_through_to_manhattan() {
+    async fn duplicate_ids_resolve_once_without_a_phantom_miss() {
         let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));
         let manhattan = FakeManhattan::new(HashMap::from([(
             42,
             ManhattanOutcome::Resolved(empty_label_map()),
         )]));
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
+        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));
 
-        let results = source.get(&[42]).await;
-
-        assert!(results.get(&42).unwrap().is_ok());
-        assert_eq!(twemcache.calls(), vec![vec![42]]);
-        assert_eq!(manhattan.calls(), vec![vec![42]]);
-    }
-
-    #[tokio::test]
-    async fn get_cache_fallback_falls_through_to_manhattan() {
-        let twemcache = FakeTwemcache::new(HashMap::from([(
-            42,
-            TwemcacheOutcome::FallThrough(FallbackReason::Timeout),
-        )]));
-        let manhattan = FakeManhattan::new(HashMap::from([(
-            42,
-            ManhattanOutcome::Resolved(empty_label_map()),
-        )]));
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
-
-        let results = source.get(&[42]).await;
+        let results = source.get(&[42, 42]).await;
 
         assert!(results.get(&42).unwrap().is_ok());
-        assert_eq!(twemcache.calls(), vec![vec![42]]);
-        assert_eq!(manhattan.calls(), vec![vec![42]]);
-    }
-
-    #[tokio::test]
-    async fn get_cached_not_found_skips_manhattan() {
-        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::NotFound)]));
-        let manhattan = FakeManhattan::new(HashMap::new());
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
-
-        let results = source.get(&[42]).await;
-
-        assert!(results.get(&42).unwrap().is_ok());
-        assert_eq!(manhattan.calls(), vec![Vec::<u64>::new()]);
-    }
-
-    #[tokio::test]
-    async fn get_twemcache_failure_resolved_by_manhattan() {
-        let twemcache = FakeTwemcache::new(HashMap::from([(
-            42,
-            TwemcacheOutcome::FallThrough(FallbackReason::Decode),
-        )]));
-        let manhattan = FakeManhattan::new(HashMap::from([(
-            42,
-            ManhattanOutcome::Failure(LookupError::new(FailureKind::ManhattanDecode, "decode")),
-        )]));
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
-
-        let results = source.get(&[42]).await;
-
-        assert!(results.get(&42).unwrap().is_err());
         assert_eq!(manhattan.calls(), vec![vec![42]]);
     }
 
@@ -273,7 +243,7 @@ mod tests {
     async fn get_missing_from_manhattan_is_fetch_error() {
         let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));
         let manhattan = FakeManhattan::new(HashMap::new());
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
+        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));
 
         let results = source.get(&[42]).await;
 
@@ -285,11 +255,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plain_miss_publishes_to_warmer() {
+        let twemcache = FakeTwemcache::new(HashMap::from([
+            (1, TwemcacheOutcome::Hit(empty_label_map())),
+            (2, TwemcacheOutcome::NotFound),
+            (3, TwemcacheOutcome::Miss),
+            (4, TwemcacheOutcome::FallThrough(FallbackReason::Timeout)),
+        ]));
+        let manhattan = FakeManhattan::new(HashMap::from([
+            (3, ManhattanOutcome::Resolved(empty_label_map())),
+            (4, ManhattanOutcome::Resolved(empty_label_map())),
+            (5, ManhattanOutcome::Resolved(empty_label_map())),
+        ]));
+        let warmer = FakeWarmer::new();
+        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan))
+            .with_warmer(Arc::<FakeWarmer>::clone(&warmer));
+
+        let results = source.get(&[1, 2, 3, 4, 5]).await;
+
+        assert_eq!(results.len(), 5);
+        assert!(results.values().all(Result::is_ok));
+        assert_eq!(manhattan.calls(), vec![vec![3, 4, 5]]);
+        assert_eq!(warmer.published(), vec![vec![3]]);
+    }
+
+    #[tokio::test]
+    async fn full_warm_channel_does_not_affect_fallback_result() {
+        use super::super::warmer::CacheWarmer;
+
+        let (warmer, _rx) = CacheWarmer::without_drain_task(1);
+        let warmer = Arc::new(warmer);
+        warmer.warm(vec![0]);
+
+        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));
+        let manhattan = FakeManhattan::new(HashMap::from([(
+            42,
+            ManhattanOutcome::Resolved(empty_label_map()),
+        )]));
+        let source =
+            RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan)).with_warmer(warmer);
+
+        let results = source.get(&[42]).await;
+
+        assert!(results.get(&42).unwrap().is_ok());
+        assert_eq!(manhattan.calls(), vec![vec![42]]);
+    }
+
+    #[tokio::test]
     async fn get_mixed_results_merges_cache_and_manhattan() {
         let twemcache = FakeTwemcache::new(HashMap::from([
             (1, TwemcacheOutcome::Hit(empty_label_map())),
             (2, TwemcacheOutcome::Miss),
-            (3, TwemcacheOutcome::Miss),
+            (3, TwemcacheOutcome::FallThrough(FallbackReason::Decode)),
         ]));
         let manhattan = FakeManhattan::new(HashMap::from([
             (2, ManhattanOutcome::Resolved(empty_label_map())),
@@ -298,7 +315,7 @@ mod tests {
                 ManhattanOutcome::Failure(LookupError::new(FailureKind::ManhattanDecode, "decode")),
             ),
         ]));
-        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
+        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));
 
         let results = source.get(&[1, 2, 3]).await;
 

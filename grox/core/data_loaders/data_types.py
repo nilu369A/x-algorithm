@@ -215,12 +215,23 @@ class VideoInfo(BaseModel):
         return max(bitrates) if bitrates else None
 
 
+class RankingQuery(BaseModel):
+    model_config = {"frozen": True}
+
+    name: str
+    frame_instruction: str
+    positive_query: str
+    negative_query: str
+
+
 class Video(BaseModel):
     id: str | None = None
     url: str | None = None
     videoInfo: VideoInfo | None = None
     animatedGifInfo: VideoInfo | None = None
     convo_video: ConvoVideo | None = None
+    crop_seconds: float | None = None
+    key_frames_ranking: RankingQuery | None = None
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":
@@ -373,7 +384,7 @@ class LegacyCard(BaseModel):
     def to_convo(self) -> list[str | ConvoImage]:
         body: list[str | ConvoImage] = []
         if self.title:
-            body.append(f"\n\nTitle: {self.title}")
+            body.append(f"\n\n[Card Title] {self.title}")
         if self.description:
             body.append(f"\n\nDescription: {self.description}")
         if self.domain:
@@ -445,7 +456,7 @@ class UnifiedCard(BaseModel):
     def to_convo(self) -> list[str | ConvoImage | ConvoVideo]:
         res: list[str | ConvoImage | ConvoVideo] = ["\n\n[Card] ", " "]
         if self.title:
-            res.append(f"\n\nTitle: {self.title}")
+            res.append(f"\n\n[Card Title] {self.title}")
         if self.description:
             res.append(f"\n\nDescription: {self.description}")
         if self.url:
@@ -528,6 +539,7 @@ class BroadcastMetadata(BaseModel):
     media_key: str | None = None
     thumbnail_image: Image | None = None
     video: Video | None = None
+    crop_seconds: float | None = None
 
     @classmethod
     def from_thrift_model(
@@ -541,8 +553,8 @@ class BroadcastMetadata(BaseModel):
             else None,
         )
 
-    def to_convo(self) -> list[str | ConvoImage]:
-        res: list[str | ConvoImage] = [
+    def to_convo(self) -> list[str | ConvoImage | ConvoVideo]:
+        res: list[str | ConvoImage | ConvoVideo] = [
             "\n\nThis post has the following broadcast metadata attached:"
         ]
         if self.thumbnail_image and self.thumbnail_image.convo_image:
@@ -597,6 +609,22 @@ class ChatGroupMetadata(BaseModel):
                 "\n\nThis post has the following chat group invite metadata attached:"
             ] + res
         return res
+
+
+class SpaceMetadata(BaseModel):
+    title: str | None = None
+
+    @classmethod
+    def from_thrift_model(cls, metadata: t.SpaceMetadata) -> "SpaceMetadata":
+        return cls(title=metadata.title)
+
+    def to_convo(self) -> list[str]:
+        if not self.title:
+            return []
+        return [
+            "\n\nThis post has the following audio space card attached:",
+            f"\nAudio Space title: {self.title}",
+        ]
 
 
 class ArticleMetadata(BaseModel):
@@ -679,6 +707,7 @@ class Post(BaseModel):
     safety_labels: list[str] | None = None
     list_metadata: ListMetadata | None = None
     chat_group_metadata: ChatGroupMetadata | None = None
+    space_metadata: SpaceMetadata | None = None
 
     def get_images(self) -> list[Image]:
         images: list[Image] = []
@@ -701,8 +730,6 @@ class Post(BaseModel):
 
     def _collect_urls(self) -> list[str]:
         urls: list[str] = list(self.urls or [])
-        if self.user and self.user.urls:
-            urls.extend(self.user.urls)
         if self.card and hasattr(self.card, "url") and self.card.url:
             urls.append(self.card.url)
         if self.cardsV2:
@@ -711,6 +738,8 @@ class Post(BaseModel):
                     for uc in cv.unified_cards:
                         if hasattr(uc, "url") and uc.url:
                             urls.append(uc.url)
+        if self.user and self.user.urls:
+            urls.extend(self.user.urls)
         return urls
 
     def extract_domains(self) -> list[str]:
@@ -720,11 +749,11 @@ class Post(BaseModel):
             except Exception:
                 return None
 
-        domains = set()
+        domains: dict[str, None] = {}
         for url in self._collect_urls():
             h = (hostname(url) or "").strip().lower()
             if h and re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", h):
-                domains.add(h)
+                domains[h] = None
         return list(domains)
 
     @classmethod
@@ -788,6 +817,12 @@ class Post(BaseModel):
             )
         else:
             chat_group_metadata = None
+        if post_metadata.spaceMetadata:
+            space_metadata = SpaceMetadata.from_thrift_model(
+                post_metadata.spaceMetadata
+            )
+        else:
+            space_metadata = None
 
         return cls(
             id=str(post_metadata.postId),
@@ -822,6 +857,7 @@ class Post(BaseModel):
             else None,
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
+            space_metadata=space_metadata,
         )
 
     @classmethod

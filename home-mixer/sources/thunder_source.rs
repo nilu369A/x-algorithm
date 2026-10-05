@@ -1,4 +1,4 @@
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{PostCandidate, RetrievalSource};
 use crate::models::in_network_reply::InNetworkReply;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{ThunderAlgorithm, ThunderClusterId, ThunderMaxResults};
@@ -39,6 +39,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for ThunderSource {
             algorithm: query.params.get(ThunderAlgorithm),
             debug: false,
             is_video_request: false,
+            per_author_limits: None,
         };
 
         let capi = self.thunder_capi_client.as_ref().filter(|_| {
@@ -112,6 +113,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for ThunderSource {
                     retweeted_tweet_id,
                     ancestors,
                     served_type: Some(served_type),
+                    retrieval_sources: vec![RetrievalSource::from_served_type(served_type)],
                     ..Default::default()
                 }
             })

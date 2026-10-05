@@ -469,7 +469,27 @@ fn parse_window_mib(v: Option<&str>, default_mib: u32) -> Option<u32> {
     (mib > 0).then(|| mib.min(1024) << 20)
 }
 
+pub(crate) fn apply_copy_port_http2(endpoint: transport::Endpoint) -> transport::Endpoint {
+    let mut endpoint = endpoint
+        .initial_connection_window_size(*H2_CONN_WINDOW)
+        .initial_stream_window_size(*H2_STREAM_WINDOW);
+    if *H2_ADAPTIVE_WINDOW {
+        endpoint = endpoint.http2_adaptive_window(true);
+    }
+    endpoint
+}
+
 pub(crate) async fn get_channels(target: String) -> Result<Vec<transport::Channel>, Status> {
+    Ok(get_channels_with_endpoints(target)
+        .await?
+        .into_iter()
+        .map(|(channel, _)| channel)
+        .collect())
+}
+
+pub(crate) async fn get_channels_with_endpoints(
+    target: String,
+) -> Result<Vec<(transport::Channel, transport::Endpoint)>, Status> {
     if target.is_empty() {
         return Ok(Vec::new());
     }
@@ -491,14 +511,12 @@ pub(crate) async fn get_channels(target: String) -> Result<Vec<transport::Channe
             .map(|(endpoint, target)| {
                 let t = target.to_string();
                 async move {
-                    let mut endpoint = endpoint
-                        .connect_timeout(*CONNECT_TIMEOUT)
-                        .initial_connection_window_size(*H2_CONN_WINDOW)
-                        .initial_stream_window_size(*H2_STREAM_WINDOW);
-                    if *H2_ADAPTIVE_WINDOW {
-                        endpoint = endpoint.http2_adaptive_window(true);
-                    }
-                    (endpoint.connect().await, t)
+                    let endpoint =
+                        apply_copy_port_http2(endpoint).connect_timeout(*CONNECT_TIMEOUT);
+                    (
+                        endpoint.connect().await.map(|channel| (channel, endpoint)),
+                        t,
+                    )
                 }
             }),
     )
@@ -537,6 +555,14 @@ pub(crate) async fn get_channels(target: String) -> Result<Vec<transport::Channe
 pub(crate) fn peer_conns_per_source() -> usize {
     parse_conns_per_source(
         std::env::var("COPY_PORT_PEER_CONNS_PER_SOURCE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn trainer_conns_per_source() -> usize {
+    parse_conns_per_source(
+        std::env::var("COPY_PORT_TRAINER_CONNS_PER_SOURCE")
             .ok()
             .as_deref(),
     )
@@ -610,12 +636,73 @@ pub(crate) async fn expand_replicated_channels(
     );
 }
 
+pub(crate) struct JoinOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> JoinOnDrop<T> {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self.handle.as_mut().expect("join").await;
+        self.handle.take();
+        result
+    }
+}
+
+struct JoinWake(std::thread::Thread);
+
+impl std::task::Wake for JoinWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+impl<T> Drop for JoinOnDrop<T> {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let mut handle = tokio::task::unconstrained(handle);
+        let thread = std::thread::current();
+        let waker = std::task::Waker::from(std::sync::Arc::new(JoinWake(thread)));
+        let mut context = std::task::Context::from_waker(&waker);
+        while std::future::Future::poll(std::pin::Pin::new(&mut handle), &mut context).is_pending()
+        {
+            std::thread::park();
+        }
+    }
+}
+
+fn install_grpc_chunk(dest: &mut [u8], pos: &mut usize, checksum: &mut u32, chunk: &[u8]) {
+    let n = chunk.len();
+    if *pos + n <= dest.len() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            copy_nontemporal(&mut dest[*pos..*pos + n], chunk);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        dest[*pos..*pos + n].copy_from_slice(chunk);
+    }
+    *pos += n;
+    adler32_combine(checksum, adler32(&chunk), n);
+}
+
 pub(crate) async fn send_entries(
     mut channel: transport::Channel,
     names: Vec<Vec<u8>>,
     offsets: Vec<usize>,
     sizes: Vec<usize>,
     buf: &mut [u8],
+    label: String,
     #[cfg(target_os = "linux")] arg: (Vec<usize>, Contexts, MRz),
 ) -> (usize, u32) {
     #[cfg(target_os = "linux")]
@@ -636,32 +723,54 @@ pub(crate) async fn send_entries(
     };
     let body = freeze(bytes);
 
-    let mut pos = 0;
-    let mut checksum = 1;
+    const GRPC_COPY_PIECE: usize = 4 << 20;
+    let dest_ptr = buf.as_mut_ptr() as usize;
+    let dest_len = buf.len();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(2);
+    let copy_join = JoinOnDrop::new(tokio::task::spawn_blocking(move || {
+        let dest = unsafe { std::slice::from_raw_parts_mut(dest_ptr as *mut u8, dest_len) };
+        let mut pos = 0;
+        let mut checksum = 1u32;
+        while let Ok(chunk) = rx.recv() {
+            install_grpc_chunk(dest, &mut pos, &mut checksum, &chunk);
+        }
+        (pos, checksum)
+    }));
     let mut endpoints = Vec::new();
     let mut rmrs = Vec::new();
     let mut use_rdma = Vec::new();
     let proto = proto![
-        (1, |_, data: &[u8]| {
-            if pos + data.len() <= buf.len() {
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    copy_nontemporal(&mut buf[pos..pos + data.len()], data);
+        (1, move |_, data: &[u8]| {
+            let mut off = 0;
+            while off < data.len() {
+                let n = (data.len() - off).min(GRPC_COPY_PIECE);
+                let piece = bytes::Bytes::copy_from_slice(&data[off..off + n]);
+                if tx.send(piece).is_err() {
+                    break;
                 }
-                #[cfg(not(target_arch = "x86_64"))]
-                buf[pos..pos + data.len()].copy_from_slice(data);
+                off += n;
             }
-            pos += data.len();
-            adler32_combine(&mut checksum, adler32(&data), data.len());
         }),
         (2, repeated_bytes(&mut endpoints)),
         (3, repeated_bytes(&mut rmrs)),
         (4, proto_parser::bytes(&mut use_rdma)),
     ];
-    if let Err(e) = ready_call_parse(SEND, proto, body, &mut channel).await {
-        log::error!("gRPC error: {e}");
+    if let Err(e) = ready_call_parse(SEND, proto, body, &mut channel, &label).await {
+        log::error!(
+            "gRPC error{suffix}: {e}",
+            suffix = if label.is_empty() {
+                String::new()
+            } else {
+                format!(" {label}")
+            }
+        );
+        let _ = copy_join.join().await;
         return (TRANSFER_FAILED_SENTINEL, 0);
     }
+    let Ok((pos, checksum)) = copy_join.join().await else {
+        return (TRANSFER_FAILED_SENTINEL, 0);
+    };
+
     use_rdma.resize(sizes.len(), 0);
     let f = |acc, (&x, &y)| if y != 0 { acc + x } else { acc };
     let size = sizes.iter().zip(&use_rdma).fold(0, f);
@@ -673,7 +782,20 @@ pub(crate) async fn send_entries(
     .await
     {
         Ok(_) => {
-            adler32_combine(&mut checksum, adler32(&&buf[pos..]), size);
+            let Ok(checksum) = JoinOnDrop::new(tokio::task::spawn_blocking(move || {
+                if size == 0 || pos >= dest_len {
+                    return checksum;
+                }
+                let dest = unsafe { std::slice::from_raw_parts(dest_ptr as *const u8, dest_len) };
+                let mut c = checksum;
+                adler32_combine(&mut c, adler32(&&dest[pos..]), size);
+                c
+            }))
+            .join()
+            .await
+            else {
+                return (TRANSFER_FAILED_SENTINEL, 0);
+            };
             (pos + size, checksum)
         }
         Err(e) => {
@@ -704,7 +826,7 @@ pub(crate) async fn list_entries(
                 (3, repeated_ints(&mut suffix_sizes)),
                 (4, repeated_ints(&mut sizes)),
             ];
-            ready_call_parse(LIST, proto, body, &mut channel).await?;
+            ready_call_parse(LIST, proto, body, &mut channel, "").await?;
 
             if sizes.len() != suffix_sizes.len() {
                 return Err(Status::invalid_argument(format!(
@@ -872,6 +994,7 @@ pub fn maybe_load_fully_replicated_tensors<'py>(
             vec![0],
             vec![size],
             b,
+            String::new(),
             #[cfg(target_os = "linux")]
             (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
         )));
@@ -887,6 +1010,7 @@ pub fn maybe_load_fully_replicated_tensors<'py>(
             vec![0],
             vec![checksums_size],
             b,
+            String::new(),
             #[cfg(target_os = "linux")]
             (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
         )));
@@ -976,6 +1100,7 @@ pub fn load_tensor_no_resharding<'py>(
 ) -> PyResult<Py<PyTuple>> {
     use crate::copy_port_client::{
         ShardOwnership, classify_shard_ownership, peer_send_max_pieces, replicated_send_ranges,
+        restore_piece_order, shuffle_sharded_schedule,
     };
 
     let runtime = runtime::Builder::new_multi_thread()
@@ -1057,6 +1182,18 @@ pub fn load_tensor_no_resharding<'py>(
         ),
     };
 
+    let schedule = match &ownership {
+        ShardOwnership::Sharded { .. } => shuffle_sharded_schedule(ranges.len(), &tensor_name),
+        ShardOwnership::Replicated { .. } => (0..ranges.len()).collect(),
+    };
+    if matches!(ownership, ShardOwnership::Sharded { .. }) && ranges.len() > 1 {
+        log::info!(
+            "copy_port: shard schedule shuffled name={tensor_name} n={} first={:?}",
+            schedule.len(),
+            &schedule[..schedule.len().min(8)]
+        );
+    }
+
     #[cfg(target_os = "linux")]
     let (contexts, devicez, mrx) = {
         let contexts = Arc::new(if matches!(ownership, ShardOwnership::Sharded { .. }) {
@@ -1101,11 +1238,13 @@ pub fn load_tensor_no_resharding<'py>(
         (contexts, devicez, mrx)
     };
 
+    let expected: Vec<usize> = ranges
+        .iter()
+        .map(|&(_, a, b)| (b - a) * shard_size)
+        .collect();
     let mut futures = Vec::<BoxFuture<_>>::with_capacity(ranges.len());
-    let mut expected = Vec::with_capacity(ranges.len());
-    for (i, &(idx, a, b)) in ranges.iter().enumerate() {
-        #[cfg(not(target_os = "linux"))]
-        let _ = i;
+    for &i in &schedule {
+        let (idx, a, b) = ranges[i];
         let n = b - a;
         let slice = &mut tensor_slice[a * shard_size..b * shard_size];
         let slice: &'static mut [u8] =
@@ -1118,10 +1257,10 @@ pub fn load_tensor_no_resharding<'py>(
             vec![0; n],
             vec![shard_size; n],
             slice,
+            format!("rank={i}"),
             #[cfg(target_os = "linux")]
             (devicez[i].clone(), contexts.clone(), mrx[i].clone()),
         )));
-        expected.push(n * shard_size);
     }
 
     let mut checksum = 1;
@@ -1135,6 +1274,9 @@ pub fn load_tensor_no_resharding<'py>(
             _ => block_on(&runtime, futures, None),
         })
         .ok_or_else(|| PyOSError::new_err("copy_port timed out waiting for tensor shards"))?;
+    let results = restore_piece_order(results, &schedule).ok_or_else(|| {
+        PyOSError::new_err("copy_port shuffled download result count/order mismatch")
+    })?;
     #[cfg(target_arch = "x86_64")]
     unsafe {
         std::arch::x86_64::_mm_sfence();
@@ -1323,6 +1465,7 @@ pub fn load_tensor_into(
                                     vec![file_offset],
                                     vec![min_count],
                                     b,
+                                    format!("shard={shard_idx}"),
                                     #[cfg(target_os = "linux")]
                                     (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
                                 )));
@@ -1593,6 +1736,9 @@ mod channel_config_tests {
     fn conns_per_source_parses_and_clamps() {
         assert_eq!(parse_conns_per_source(None), 1);
         assert_eq!(parse_conns_per_source(Some("bogus")), 1);
+        assert_eq!(parse_conns_per_source(Some("")), 1);
+        assert_eq!(parse_conns_per_source(Some("-1")), 1);
+        assert_eq!(parse_conns_per_source(Some("18446744073709551616")), 1);
         assert_eq!(parse_conns_per_source(Some("4")), 4);
         assert_eq!(parse_conns_per_source(Some("0")), 1);
         assert_eq!(parse_conns_per_source(Some("64")), 16);

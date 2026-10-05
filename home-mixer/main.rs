@@ -26,6 +26,11 @@ struct Args {
     datacenter: String,
     #[arg(long, default_value = "")]
     otel_endpoint: String,
+    #[arg(
+        long,
+        help = "Write the popular-authors list (author_id,follower_count rows on stdin) to Manhattan and exit"
+    )]
+    import_popular_authors: bool,
 
     #[arg(long, default_value = "penalized_peak_ewma")]
     phoenix_xds_lb_policy: String,
@@ -94,6 +99,9 @@ fn parse_shard(args: &Args) -> Option<ShardCoordinate> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.import_popular_authors {
+        return import_popular_authors(&args.datacenter).await;
+    }
     let shard_coordinate = parse_shard(&args);
 
     xai_stringcenter::init_from_file(params::STRINGCENTER_BUNDLE_PATH);
@@ -137,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
         .metrics_port(args.metrics_port)
         .datacenter(args.datacenter)
         .otel_endpoint(args.otel_endpoint)
-        .with_featureswitches(params::FS_PATH, true)
+        .with_featureswitches_experiment_logging(params::FS_PATH)
         .with_decider(params::decider_path(), None)
         .with_tls(TlsMode::server_mtls_from_env()?)
         .with_max_connection_age(Duration::from_secs(300))
@@ -151,4 +159,38 @@ async fn main() -> anyhow::Result<()> {
             vm_ranker_xds,
         })
         .await
+}
+
+async fn import_popular_authors(datacenter: &str) -> anyhow::Result<()> {
+    use std::io::Read;
+    use xai_home_mixer::clients::popular_authors_store_client::ManhattanPopularAuthorsStore;
+    use xai_home_mixer::util::popular_authors::{
+        now_ms, parse_author_rows, sort_by_followers, PopularAuthorsStore, StoredPopularAuthors,
+    };
+
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text)?;
+    let authors = sort_by_followers(parse_author_rows(&text).map_err(anyhow::Error::msg)?);
+    anyhow::ensure!(!authors.is_empty(), "no popular authors on stdin");
+    let store = ManhattanPopularAuthorsStore::new(datacenter).await?;
+    store
+        .save(&StoredPopularAuthors {
+            updated_at_ms: now_ms(),
+            authors: authors.clone(),
+        })
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let read_back = store
+        .load()
+        .await
+        .map_err(anyhow::Error::msg)?
+        .map_or(0, |s| s.authors.len());
+    println!(
+        "wrote {} popular authors (followers {}..{}), read back {}",
+        authors.len(),
+        authors.last().map_or(0, |a| a.follower_count),
+        authors[0].follower_count,
+        read_back
+    );
+    Ok(())
 }

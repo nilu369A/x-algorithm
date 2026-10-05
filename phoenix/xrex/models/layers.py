@@ -7,8 +7,6 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.experimental.shard_map import shard_map
-from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
 
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
@@ -32,6 +30,7 @@ from xrex.models.recsys_attention import (
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
 from xrex.utils.model import MemoryModelOutput
+from xrex.utils.sharding import maybe_shard_map, with_sharding_constraint
 
 
 class RotaryEmbedding(hk.Module):
@@ -208,9 +207,9 @@ class MultiHeadAttention(hk.Module):
             qkv = jnp.reshape(qkv, (qkv.shape[0], qkv.shape[1], num_kv_heads, -1, qkv.shape[-1]))
 
             out_specs = (qkv_pspec,) * 3
-            query_heads, key_heads, value_heads = shard_map(slicing, mesh, qkv_pspec, out_specs)(
-                qkv
-            )
+            query_heads, key_heads, value_heads = maybe_shard_map(
+                slicing, mesh, qkv_pspec, out_specs, check_vma=False
+            )(qkv)
 
         else:
             query_heads = projection(

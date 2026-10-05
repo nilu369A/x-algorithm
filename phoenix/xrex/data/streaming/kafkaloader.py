@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import re
+import ssl
 import threading
 import time
 import urllib.parse
@@ -49,6 +50,7 @@ from xrex.data.streaming.kafkaconsumer import (
     DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
     ConsumerMode,
     DropModeController,
+    KafkaAuth,
     PartitionLagTracker,
     consume_messages,
     discover_partition_count,
@@ -261,7 +263,7 @@ def _start_reset_http_server(base_port: int, num_ports: int) -> int | None:
 
 def _init_otel_metrics(
     otel_endpoint: str,
-    export_interval_ms: int = 30_000,
+    export_interval_ms: int = 120_000,
     worker_rank: int = 0,
     training_name: str = "recsys-kafka-loader",
 ) -> bool:
@@ -759,7 +761,8 @@ def _unify_record_batch_schemas(
                         raise
                 new_columns.append(col)
             else:
-                logger.warning(f"Column {name} not found in batch")
+                if name in required_columns:
+                    logger.warning(f"Column {name} not found in batch")
                 new_columns.append(pa.nulls(num_rows, type=target_type))
         result.append(pa.RecordBatch.from_arrays(new_columns, names=col_names))
 
@@ -778,7 +781,8 @@ def ensure_sasl_password_env(cluster_name: str) -> None:
     pass
 
 
-def resolve_internal_bootstrap(bootstrap_servers: str) -> str:
+def resolve_internal_bootstrap(bootstrap_servers: str, auth_mode: str = "sasl") -> str:
+    del auth_mode
     if _has_port(bootstrap_servers.strip()):
         return bootstrap_servers
     return settings.KAFKA_BOOTSTRAP_SERVERS or bootstrap_servers
@@ -789,8 +793,143 @@ def cluster_sasl_username(cluster_name: str) -> str:
     return settings.KAFKA_SASL_USERNAME
 
 
-def _resolve_bootstrap_servers(bootstrap_servers: str) -> str:
+_DEFAULT_MTLS_CERTS_DIR = "/root/client-certs"
+_MTLS_CA_BUNDLE = "ca-bundle.crt"
+_MTLS_CLIENT_CERT = "client.fullchain"
+_MTLS_CLIENT_KEY = "client.key"
+
+_PLATFORM_CA_BUNDLE_PATH = "/etc/ssl/internal-ca/ca-bundle.crt"
+
+
+def _mtls_certs_dir() -> str:
+    return os.environ.get("KAFKA_MTLS_CERTS_DIR", _DEFAULT_MTLS_CERTS_DIR)
+
+
+def _mtls_cert_paths(certs_dir: str) -> tuple[str, str, str] | None:
+    ca = os.path.join(certs_dir, _MTLS_CA_BUNDLE)
+    cert = os.path.join(certs_dir, _MTLS_CLIENT_CERT)
+    key = os.path.join(certs_dir, _MTLS_CLIENT_KEY)
+    paths = (ca, cert, key)
+    missing = [p for p in paths if not os.path.isfile(p) or os.path.getsize(p) == 0]
+    if not missing:
+        return paths
+    present = [p for p in paths if os.path.exists(p)]
+    if present:
+        rank_logger.warning(
+            "Incomplete Kafka mTLS certs in %s (missing/empty: %s); "
+            "falling back to the downloaded certificate or SASL password.",
+            certs_dir,
+            ", ".join(os.path.basename(p) for p in missing),
+        )
+    return None
+
+
+def _mtls_client_paths(certs_dir: str) -> tuple[str, str] | None:
+    cert = os.path.join(certs_dir, _MTLS_CLIENT_CERT)
+    key = os.path.join(certs_dir, _MTLS_CLIENT_KEY)
+    pair = (cert, key)
+    if all(os.path.isfile(p) and os.path.getsize(p) > 0 for p in pair):
+        return pair
+    return None
+
+
+def platform_ca_bundle_path() -> str | None:
+    path = os.environ.get("KAFKA_MTLS_PLATFORM_CA_BUNDLE", "").strip() or _PLATFORM_CA_BUNDLE_PATH
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+    return None
+
+
+def system_ca_bundle_path() -> str | None:
+    cafile = ssl.get_default_verify_paths().cafile
+    if cafile and os.path.isfile(cafile) and os.path.getsize(cafile) > 0:
+        return cafile
+    return None
+
+
+def _try_resolve_sasl_password(bootstrap_servers: str) -> str | None:
+    del bootstrap_servers
+    return os.environ.get("SASL_PLAIN_PASSWORD") or None
+
+
+def _resolve_mtls_bootstrap(bootstrap_servers: str) -> str:
     bs = bootstrap_servers.strip()
+    if _has_port(bs):
+        return bs
+    raise ValueError(
+        f"Cannot resolve mTLS bootstrap for {bs!r}: provide a raw broker address "
+        "(host:port[,host:port...]) — cluster-name resolution is internal-only."
+    )
+
+
+def auto_detect_auth(
+    bootstrap_servers: str,
+    sasl_mechanism: str,
+    sasl_username: str,
+    certs_dir: str | None = None,
+    download_dir: str | None = None,
+) -> KafkaAuth:
+    del download_dir
+    certs_dir = certs_dir if certs_dir is not None else _mtls_certs_dir()
+    force = os.environ.get("KAFKA_AUTH", "").strip().lower()
+    verify_broker = os.environ.get("KAFKA_MTLS_VERIFY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    paths = _mtls_cert_paths(certs_dir)
+
+    if force == "sasl":
+        rank_logger.info("Kafka auth: KAFKA_AUTH=sasl, skipping mTLS certs.")
+    elif paths is not None:
+        rank_logger.info("Kafka auth: using mTLS certificates from %s", certs_dir)
+        ca, cert, key = paths
+        return KafkaAuth.mtls(ca, cert, key, verify_broker=verify_broker)
+    else:
+        client = _mtls_client_paths(certs_dir)
+        if client is not None:
+            truststore = platform_ca_bundle_path() if verify_broker else None
+            if verify_broker and truststore is None:
+                rank_logger.warning(
+                    "Kafka auth: client certificate mounted at %s without %s and no "
+                    "platform CA bundle; verifying the brokers against the system "
+                    "trust store. Point KAFKA_MTLS_PLATFORM_CA_BUNDLE at a PEM if the "
+                    "handshake fails with CERTIFICATE_VERIFY_FAILED.",
+                    certs_dir,
+                    _MTLS_CA_BUNDLE,
+                )
+            else:
+                rank_logger.info(
+                    "Kafka auth: client certificate from %s, broker truststore %s",
+                    certs_dir,
+                    truststore or "off (set KAFKA_MTLS_VERIFY=1 to enable it)",
+                )
+            return KafkaAuth.mtls(truststore, *client, verify_broker=verify_broker)
+        if force == "mtls":
+            raise RuntimeError(
+                f"KAFKA_AUTH=mtls but no client certs were found under {certs_dir} "
+                f"(expected {_MTLS_CA_BUNDLE}, {_MTLS_CLIENT_CERT}, {_MTLS_CLIENT_KEY})."
+            )
+
+    password = _try_resolve_sasl_password(bootstrap_servers)
+    if password:
+        sasl_username = sasl_username or settings.KAFKA_SASL_USERNAME
+        rank_logger.info("Kafka auth: using SASL/SCRAM (%s) as %s", sasl_mechanism, sasl_username)
+        return KafkaAuth.sasl(sasl_mechanism, sasl_username, password)
+
+    raise RuntimeError(
+        "No Kafka credentials found.\n"
+        f"  Tried mTLS certs at {certs_dir} "
+        f"(need {_MTLS_CA_BUNDLE}, {_MTLS_CLIENT_CERT}, {_MTLS_CLIENT_KEY})\n"
+        "  Tried SASL via SASL_PLAIN_PASSWORD.\n"
+        f"Set SASL_PLAIN_PASSWORD, or mount a client certificate at {certs_dir}."
+    )
+
+
+def _resolve_bootstrap_servers(bootstrap_servers: str, auth_mode: str = "sasl") -> str:
+    bs = bootstrap_servers.strip()
+    if auth_mode == "mtls":
+        return _resolve_mtls_bootstrap(bs)
     if _has_port(bs):
         rank_logger.info(f"Using raw bootstrap servers: {bs}")
         return bs
@@ -855,7 +994,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
     export_metrics: bool = True
     otel_endpoint: str = ""
-    metrics_export_interval_ms: int = 30_000
+    metrics_export_interval_ms: int = 120_000
 
     num_local_workers: int = 8
 
@@ -866,17 +1005,23 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
     compute_post_unexplored_label: bool = False
 
+    exclude_required_columns: str = ""
+
     def kafka_to_training_batch(
         self, batch: list[pa.RecordBatch], batch_size: int, shard_index: int = 0
     ) -> RecsysFeaturesBatch:
         del batch_size
         start_time = time.time()
 
+        required_columns: list[str] = list(REQUIRED_COLUMNS)
+        if self.exclude_required_columns:
+            excluded = {c.strip() for c in self.exclude_required_columns.split(",") if c.strip()}
+            required_columns = [c for c in required_columns if c not in excluded]
+
         if not self._logged_schema and batch:
             first_rb = batch[0]
             available_cols = first_rb.schema.names
-            expected_cols = REQUIRED_COLUMNS
-            missing_cols = [col for col in expected_cols if col not in available_cols]
+            missing_cols = [col for col in required_columns if col not in available_cols]
             if missing_cols:
                 rank_logger.error(
                     f"Schema mismatch! Missing required columns: {missing_cols}. "
@@ -886,7 +1031,6 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.info(f"Schema validated. Available columns: {available_cols}")
             self._logged_schema = True
 
-        required_columns: list[str] = list(REQUIRED_COLUMNS)
         if self.multimodal_embedding_type is not None:
             embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
             if batch and embedding_col_name in batch[0].schema.names:
@@ -935,6 +1079,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
+            ads_head_masking=self.ads_head_masking,
         )
 
         elapsed = time.time() - t
@@ -1009,8 +1154,8 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     "If you are trying to recover from an outage in production, and are tempted to set reset_to_latest=True, then remember: you must harvest one checkpoint and restart training with reset_to_latest=False and i_know_what_i_am_doing=False"
                 )
 
-        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]] = queue.Queue(
-            maxsize=self.max_queue_size
+        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]] | Exception] = (
+            queue.Queue(maxsize=self.max_queue_size)
         )
         consumer = threading.Thread(
             target=self._async_kafka_consumer_arrow,
@@ -1045,7 +1190,10 @@ class PhoenixKafkaDataset(PhoenixDataset):
                         example_queue.qsize()
                     )
 
-                batch, offsets = example_queue.get(timeout=1.0)
+                item = example_queue.get(timeout=1.0)
+                if isinstance(item, Exception):
+                    raise item
+                batch, offsets = item
                 self.offset_ptr.update(offsets)
                 consecutive_empty_count = 0
 
@@ -1069,8 +1217,16 @@ class PhoenixKafkaDataset(PhoenixDataset):
                         f"No data in the queue. Consecutive empty count: {consecutive_empty_count}, total loop count: {total_loop_count}, total empty count: {total_empty_count}"
                     )
 
-    def _resolve_bootstrap_servers(self) -> str:
-        return _resolve_bootstrap_servers(self.bootstrap_servers)
+    def _detect_auth(self) -> KafkaAuth:
+        return auto_detect_auth(
+            self.bootstrap_servers,
+            self.sasl_mechanism,
+            self.sasl_plain_username,
+        )
+
+    def _resolve_bootstrap_servers(self, auth: KafkaAuth | None = None) -> str:
+        mode = auth.mode if auth is not None else "sasl"
+        return _resolve_bootstrap_servers(self.bootstrap_servers, auth_mode=mode)
 
     def ensure_partition_count(self) -> None:
         if self.num_kafka_partitions is not None:
@@ -1078,15 +1234,16 @@ class PhoenixKafkaDataset(PhoenixDataset):
         if not self.topic_name:
             return
         try:
-            bootstrap_servers = self._resolve_bootstrap_servers()
-            sasl_plain_password = _resolve_sasl_password(self.bootstrap_servers)
+            auth = self._detect_auth()
+            bootstrap_servers = self._resolve_bootstrap_servers(auth)
             count = asyncio.run(
                 discover_partition_count(
                     topic=self.topic_name,
                     bootstrap_servers=bootstrap_servers,
                     sasl_mechanism=self.sasl_mechanism,
                     sasl_plain_username=self.sasl_plain_username,
-                    sasl_plain_password=sasl_plain_password,
+                    sasl_plain_password=auth.sasl_password or "",
+                    auth=auth,
                 )
             )
             object.__setattr__(self, "num_kafka_partitions", count)
@@ -1139,7 +1296,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
     def _async_kafka_consumer_arrow(
         self,
-        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]],
+        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]] | Exception],
         batch_size: int,
         shard_index: int,
         num_shards: int,
@@ -1179,8 +1336,9 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     shard_index=shard_index,
                 )
 
-                bootstrap_servers = self._resolve_bootstrap_servers()
-                sasl_plain_password = _resolve_sasl_password(self.bootstrap_servers)
+                auth = self._detect_auth()
+                bootstrap_servers = self._resolve_bootstrap_servers(auth)
+                sasl_plain_password = auth.sasl_password or ""
 
                 try:
                     discovered_count = await discover_partition_count(
@@ -1189,6 +1347,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
                         sasl_mechanism=self.sasl_mechanism,
                         sasl_plain_username=self.sasl_plain_username,
                         sasl_plain_password=sasl_plain_password,
+                        auth=auth,
                     )
                 except Exception as e:
                     if self.num_kafka_partitions is not None:
@@ -1244,6 +1403,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     sasl_mechanism=self.sasl_mechanism,
                     sasl_plain_username=self.sasl_plain_username,
                     sasl_plain_password=sasl_plain_password,
+                    auth=auth,
                     bootstrap_servers=bootstrap_servers,
                     reset_to_latest=self.reset_to_latest,
                     seek_to_timestamp_ms=self.seek_to_timestamp_ms,

@@ -2,39 +2,22 @@
 # Copyright 2026 X.AI Corp.
 """CUDA kernels used by ``xrex``.
 
-``xrex`` needs three generic array primitives that xAI maintains as CUDA
-kernels: an Adler-32 checksum (checkpoint integrity), a 1-D int32 dedupe
-(the training embedding compressor) and a batched top-k (the retrieval
-serving path). This directory is the single implementation of all three.
+``adler32`` (checkpoint integrity), ``unique`` (training embedding compressor) and
+``top_k_by_key`` (retrieval serving) each have a pure-JAX (or zlib) reference path and a
+compiled path. Each subpackage imports ``xrex_cuda_kernels.<api>`` at import time: on success
+it registers the kernel as an XLA FFI target; on ``ModuleNotFoundError`` it logs a warning and
+runs the reference, so a venv silently stuck on the reference path is visible.
 
-One more kernel lives here with a different contract: ``async_emb``
-(pipelined embedding communication) has NO reference path — it raises a loud,
-named ImportError when its compiled extension is absent, and its callers
-treat that as "the feature is off" (``use_async_emb``).
+``async_emb``, ``row_emb`` and ``fa3`` are compiled-only: a missing extension raises a named
+``ImportError`` that callers treat as the feature being unavailable (``use_async_emb``,
+``use_row_emb``, ``attn_impl="flash_attn"``). For every kernel, a present-but-broken extension
+raises its own error.
 
-Each of the three primitive kernels is a subpackage with the same two-layer
-shape:
+FFI target names are prefixed ``xrex_`` except top-k's ``top_k_by_key*``, which serving
+matches by name.
 
-* a **reference implementation in pure JAX (or zlib) that always works** — no
-  compiler, no CUDA, no extension module. This is the path that runs unless a
-  compiled extension is present, and it is what an installation without
-  ``nvcc`` gets;
-* the **CUDA/C++ source** under ``<kernel>/src/``, with the shared XLA-FFI
-  helpers under ``xla_utils/``. Building it produces a nanobind extension named
-  after the file (``adler32_api``, ``unique_api``, ``top_k_by_key_api``, ...),
-  and each subpackage tries to import that extension from its own ``src/`` at
-  import time. When the import succeeds the kernel is registered as an XLA FFI
-  target and used instead of the reference; when it fails the reference stands.
-
-The FFI target names are prefixed ``xrex_``.
-
-**The extensions are built out of tree, never by ``uv sync``.** The compiled
-path is optional by design, so the package installs and the reference kernels
-run on a box with no ``nvcc``. To compile one yourself you need ``nvcc``, the
-XLA FFI headers (``xla/ffi/api/ffi.h``, from jaxlib), nanobind, and — for
-``unique`` and ``top_k_by_key`` — CUB/Thrust/CUTLASS from the CUDA toolkit.
-Compile ``<kernel>/src/*.cu`` and ``*.cc`` into a shared object named for its
-``NB_MODULE`` and drop it in ``<kernel>/src/``, with the repository root on the
-include path so ``xrex/cuda/xla_utils/...`` resolves (``async_emb`` localizes
-its includes and needs only its own ``src/``).
+The ``xrex-cuda-kernels`` package is a bazel wheel defined by ``xrex/cuda/wheel/BUILD``.
+Installing ``xrex/cuda/wheel`` with ``pip``/``uv`` runs that build through
+``wheel/backend.py`` (needs bazelisk and git; the CUDA toolchain is fetched hermetically).
+``wheel_inventory_test.py`` fails if a kernel lacks its build, wheel entry or loader import.
 """

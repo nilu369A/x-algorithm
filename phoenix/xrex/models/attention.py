@@ -6,12 +6,11 @@ from typing import Any, Callable, Optional
 import haiku as hk
 import jax
 import jax.numpy as jnp
-from jax.experimental.shard_map import shard_map
-from jax.lax import with_sharding_constraint
 
 from xai_configlib import Config, configclass
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
+from xrex.utils.sharding import maybe_shard_map, with_sharding_constraint
 
 
 @configclass
@@ -127,12 +126,12 @@ class CustomAttention(Attention):
             )
         )
 
-        return shard_map(
+        return maybe_shard_map(
             body_fn,
             mesh=self.sharding_context.mesh,
             in_specs=in_specs,
             out_specs=out_spec,
-            check_rep=False,
+            check_vma=False,
         )(
             query,
             key,

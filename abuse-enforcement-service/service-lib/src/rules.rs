@@ -51,6 +51,7 @@ enum ActionStep {
 enum SpecialOutcome {
                     Skip { reason: String },
                         ActAll { actions: Vec<ActionStep> },
+                        ActRequestedActions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -172,6 +173,7 @@ fn outcome_to_decision(o: &Outcome) -> Decision {
         Outcome::Special(SpecialOutcome::ActAll { actions }) => {
             Decision::Act(actions.iter().map(step_to_spec).collect())
         }
+        Outcome::Special(SpecialOutcome::ActRequestedActions) => Decision::ActRequestedActions,
         Outcome::Action(step) => Decision::Act(vec![step_to_spec(step)]),
     }
 }
@@ -182,6 +184,18 @@ struct ScoreCel<'a> {
                 labels: &'a [String],
     model_version: &'a str,
                         skip_author_credibility_prechecks: bool,
+                        requested_actions: Vec<RequestedActionCel<'a>>,
+            policy_version: &'a str,
+}
+
+#[derive(Serialize)]
+struct RequestedActionCel<'a> {
+    kind: &'a str,
+    perm: bool,
+    policy: &'a str,
+    labels: &'a [String],
+    ttl_msec: i64,
+    head: &'a str,
 }
 
 #[derive(Serialize)]
@@ -217,6 +231,20 @@ fn project_score(facts: &Facts) -> ScoreCel<'_> {
         labels: &facts.score.labels,
         model_version: &facts.score.model_version,
         skip_author_credibility_prechecks: facts.score.skip_author_credibility_prechecks,
+        requested_actions: facts
+            .score
+            .requested_actions
+            .iter()
+            .map(|a| RequestedActionCel {
+                kind: &a.kind,
+                perm: a.perm,
+                policy: &a.policy,
+                labels: &a.labels,
+                ttl_msec: a.ttl_msec,
+                head: &a.head,
+            })
+            .collect(),
+        policy_version: &facts.score.policy_version,
     }
 }
 
@@ -353,8 +381,8 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-fn nonempty(override_yaml: Option<&str>) -> Option<&str> {
-    override_yaml.map(str::trim).filter(|s| !s.is_empty())
+fn nonempty(override_yaml: Option<&Arc<str>>) -> Option<&Arc<str>> {
+    override_yaml.filter(|s| !s.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -376,8 +404,15 @@ pub struct RuleStatus {
 }
 
 struct CacheEntry {
+                    src: Arc<str>,
     hash: u64,
     compiled: Result<Arc<CompiledRules>, String>,
+}
+
+impl CacheEntry {
+        fn same_src(&self, src: &Arc<str>) -> Option<Result<Arc<CompiledRules>, String>> {
+        Arc::ptr_eq(&self.src, src).then(|| self.compiled.clone())
+    }
 }
 
 struct RuleSlot {
@@ -420,22 +455,24 @@ impl RuleSlot {
         }
     }
 
-            fn compile_and_cache(&self, src: &str, h: u64) -> Result<Arc<CompiledRules>, String> {
+            fn compile_and_cache(&self, src: &Arc<str>, h: u64) -> Result<Arc<CompiledRules>, String> {
         let mut w = self.cached.write().unwrap();
-        if let Some(e) = &*w
+        if let Some(e) = &mut *w
             && e.hash == h
         {
+            e.src = src.clone();
             return e.compiled.clone();
         }
         let et = self.entity_type.as_str();
-        let compiled: Result<Arc<CompiledRules>, String> = match CompiledRules::from_yaml(src) {
-            Ok(c) if c.entity_type == self.entity_type => Ok(Arc::new(c)),
-            Ok(c) => Err(format!(
-                "override `for_entity` ({:?}) does not match this pipeline ({et})",
-                c.entity_type,
-            )),
-            Err(e) => Err(e.to_string()),
-        };
+        let compiled: Result<Arc<CompiledRules>, String> =
+            match CompiledRules::from_yaml(src.trim()) {
+                Ok(c) if c.entity_type == self.entity_type => Ok(Arc::new(c)),
+                Ok(c) => Err(format!(
+                    "override `for_entity` ({:?}) does not match this pipeline ({et})",
+                    c.entity_type,
+                )),
+                Err(e) => Err(e.to_string()),
+            };
         let label = if compiled.is_ok() { "success" } else { "fail" };
         crate::metrics::RULES_YAML_COMPILED
             .with_label_values(&[et, label])
@@ -450,32 +487,33 @@ impl RuleSlot {
             );
         }
         *w = Some(CacheEntry {
+            src: src.clone(),
             hash: h,
             compiled: compiled.clone(),
         });
         compiled
     }
 
-            fn resolve(&self, override_yaml: Option<&str>) -> Arc<CompiledRules> {
-        if let Some(src) = nonempty(override_yaml) {
-            let h = hash_str(src);
-            if let Some(e) = &*self.cached.read().unwrap()
-                && e.hash == h
-            {
-                return match &e.compiled {
-                    Ok(arc) => arc.clone(),
-                    Err(_) => self.last_good_arc(),
-                };
-            }
-            return match self.compile_and_cache(src, h) {
-                Ok(arc) => arc,
-                Err(_) => self.last_good_arc(),
-            };
+                                fn compiled_for(&self, src: &Arc<str>) -> (u64, Result<Arc<CompiledRules>, String>) {
+        let cached = self.cached.read().unwrap();
+        if let Some(e) = &*cached
+            && let Some(hit) = e.same_src(src)
+        {
+            return (e.hash, hit);
         }
-        self.last_good_arc()
+        drop(cached);
+        let h = hash_str(src.trim());
+        (h, self.compile_and_cache(src, h))
     }
 
-    fn status(&self, override_yaml: Option<&str>) -> RuleStatus {
+            fn resolve(&self, override_yaml: Option<&Arc<str>>) -> Arc<CompiledRules> {
+        match nonempty(override_yaml).map(|src| self.compiled_for(src).1) {
+            Some(Ok(arc)) => arc,
+            _ => self.last_good_arc(),
+        }
+    }
+
+    fn status(&self, override_yaml: Option<&Arc<str>>) -> RuleStatus {
         let entity = self.entity_type.as_str();
         let Some(src) = nonempty(override_yaml) else {
             let last = self.last_good_arc();
@@ -488,18 +526,7 @@ impl RuleSlot {
                 rule_ids: last.rule_ids().map(str::to_string).collect(),
             };
         };
-        let h = hash_str(src);
-        let cached = {
-            let guard = self.cached.read().unwrap();
-            match &*guard {
-                Some(e) if e.hash == h => Some(e.compiled.clone()),
-                _ => None,
-            }
-        };
-        let compiled = match cached {
-            Some(c) => c,
-            None => self.compile_and_cache(src, h),
-        };
+        let (h, compiled) = self.compiled_for(src);
         let override_hash = Some(format!("{h:016x}"));
         match compiled {
             Ok(arc) => RuleStatus {
@@ -583,12 +610,12 @@ impl RulesCache {
             pub fn resolve(
         &self,
         entity_type: EntityType,
-        override_yaml: Option<&str>,
+        override_yaml: Option<&Arc<str>>,
     ) -> Arc<CompiledRules> {
         self.slot(entity_type).resolve(override_yaml)
     }
 
-        pub fn status(&self, entity_type: EntityType, override_yaml: Option<&str>) -> RuleStatus {
+        pub fn status(&self, entity_type: EntityType, override_yaml: Option<&Arc<str>>) -> RuleStatus {
         self.slot(entity_type).status(override_yaml)
     }
 }
@@ -642,6 +669,7 @@ mod tests {
         for id in [
             "user_in_allowlist",
             "user_not_found",
+            "very_high_follower_count",
             "high_follower_count",
             "pagerank_skipped",
         ] {
@@ -651,6 +679,17 @@ mod tests {
                 user.rule_ids
             );
         }
+        let pos = |id: &str| {
+            user.rule_ids
+                .iter()
+                .position(|r| r == id)
+                .unwrap_or_else(|| panic!("user pipeline missing {id:?}"))
+        };
+        assert!(
+            pos("very_high_follower_count") < pos("high_follower_count"),
+            "very_high_follower_count must precede high_follower_count; got {:?}",
+            user.rule_ids
+        );
         for id in [
             "post_in_allowlist",
             "user_in_allowlist",
@@ -669,7 +708,7 @@ mod tests {
     #[test]
     fn rules_cache_uses_valid_override() {
         let cache = minimal_seeded();
-        let info = cache.status(EntityType::User, Some(OVERRIDE_USER_YAML));
+        let info = cache.status(EntityType::User, Some(&Arc::from(OVERRIDE_USER_YAML)));
         assert_eq!(info.source, RuleSource::Dynamic);
         assert!(info.override_present);
         assert_eq!(info.error, None);
@@ -699,7 +738,7 @@ mod tests {
     #[test]
     fn rules_cache_blank_override_uses_static_seed() {
         let cache = minimal_seeded();
-        let s = cache.status(EntityType::User, Some("   \n "));
+        let s = cache.status(EntityType::User, Some(&Arc::from("   \n ")));
         assert_eq!(s.source, RuleSource::Static);
         assert!(!s.override_present);
     }
@@ -707,7 +746,7 @@ mod tests {
     #[test]
     fn rules_cache_falls_back_on_bad_yaml() {
         let cache = minimal_seeded();
-        let info = cache.status(EntityType::User, Some("not: [valid"));
+        let info = cache.status(EntityType::User, Some(&Arc::from("not: [valid")));
         assert_eq!(info.source, RuleSource::Static);
         assert!(info.override_present);
         assert!(info.error.is_some());
@@ -717,14 +756,14 @@ mod tests {
     #[test]
     fn rules_cache_bad_after_good_keeps_last_good() {
         let cache = minimal_seeded();
-        let _ = cache.status(EntityType::User, Some(OVERRIDE_USER_YAML));
+        let _ = cache.status(EntityType::User, Some(&Arc::from(OVERRIDE_USER_YAML)));
         assert_eq!(
             cache
-                .status(EntityType::User, Some(OVERRIDE_USER_YAML))
+                .status(EntityType::User, Some(&Arc::from(OVERRIDE_USER_YAML)))
                 .source,
             RuleSource::Dynamic
         );
-        let info = cache.status(EntityType::User, Some("not: [valid"));
+        let info = cache.status(EntityType::User, Some(&Arc::from("not: [valid")));
         assert_eq!(info.source, RuleSource::LastGood);
         assert!(info.override_present);
         assert!(info.error.is_some());
@@ -735,7 +774,7 @@ mod tests {
     fn rules_cache_falls_back_on_entity_mismatch() {
         let cache = minimal_seeded();
         let yaml = "for_entity: post\nrules:\n  - id: x\n    when: \"true\"\n    then: {kind: skip, reason: t}\n";
-        let info = cache.status(EntityType::User, Some(yaml));
+        let info = cache.status(EntityType::User, Some(&Arc::from(yaml)));
         assert_eq!(info.source, RuleSource::Static);
         assert!(info.override_present);
         assert!(info.error.as_deref().unwrap_or("").contains("for_entity"));
@@ -745,9 +784,24 @@ mod tests {
     #[test]
     fn rules_cache_resolve_returns_override_pipeline() {
         let cache = minimal_seeded();
-        let compiled = cache.resolve(EntityType::User, Some(OVERRIDE_USER_YAML));
+        let compiled = cache.resolve(EntityType::User, Some(&Arc::from(OVERRIDE_USER_YAML)));
         let ids: Vec<&str> = compiled.rule_ids().collect();
         assert_eq!(ids, vec!["ovr_rule"]);
+    }
+
+    #[test]
+    fn rules_cache_same_arc_and_same_text_reuse_the_compile() {
+        let cache = minimal_seeded();
+        let first: Arc<str> = Arc::from(OVERRIDE_USER_YAML);
+        let a = cache.resolve(EntityType::User, Some(&first));
+        let b = cache.resolve(EntityType::User, Some(&first));
+        assert!(Arc::ptr_eq(&a, &b));
+        let copy: Arc<str> = Arc::from(OVERRIDE_USER_YAML);
+        let c = cache.resolve(EntityType::User, Some(&copy));
+        assert!(Arc::ptr_eq(&a, &c));
+        let other: Arc<str> = Arc::from(OVERRIDE_USER_YAML.replace("ovr_rule", "ovr_rule_2"));
+        let d = cache.resolve(EntityType::User, Some(&other));
+        assert_eq!(d.rule_ids().collect::<Vec<_>>(), vec!["ovr_rule_2"]);
     }
 
     #[test]
@@ -793,8 +847,8 @@ mod tests {
                 fn post_facts(author: UserFacts, score_labels: Vec<String>) -> Facts {
         let mut f = base_facts();
         f.entity_type = EntityType::Post;
-        f.entity_id = 999; 
-        f.user_id = 1; 
+        f.entity_id = 999;
+        f.user_id = 1;
         f.score.labels = score_labels;
         f.entity = EntityFacts::Post(PostFacts {
             present: false,
@@ -1069,6 +1123,249 @@ rules:
     }
 
 
+            fn facts_with_requested_action() -> Facts {
+        let mut f = base_facts();
+        f.score.requested_actions = vec![crate::facts::RequestedActionFacts {
+            kind: "suspend".into(),
+            perm: false,
+            policy: "PlatformManipulation".into(),
+            labels: vec!["SpamHighRecall".into()],
+            ttl_msec: 1000,
+            head: "IsSpammer".into(),
+        }];
+        f.score.policy_version = "3".into();
+        f
+    }
+
+    #[test]
+    fn act_requested_actions_outcome_parses_and_maps_to_decision() {
+        let rules = one_rule_pipeline(
+            r#"
+rules:
+  - id: generic_test
+    when: "size(score.requested_actions) > 0"
+    then:
+      kind: act_requested_actions
+  - id: fallthrough
+    when: "true"
+    then: {kind: skip, reason: no_requested_actions}
+"#,
+        );
+        assert_eq!(
+            decide_with(&rules, &base_facts()).expect("eval should succeed"),
+            Decision::Skip("no_requested_actions".into())
+        );
+        assert_eq!(
+            decide_with(&rules, &facts_with_requested_action()).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+    }
+
+    #[test]
+    fn requested_actions_entries_and_policy_version_are_cel_readable() {
+        let rules = one_rule_pipeline(
+            r#"
+rules:
+  - id: entry_fields
+    when: >
+      score.policy_version == "3"
+      && score.requested_actions.exists(a,
+           a.kind == "suspend"
+           && a.policy == "PlatformManipulation"
+           && !a.perm
+           && a.ttl_msec == 1000
+           && a.head == "IsSpammer"
+           && "SpamHighRecall" in a.labels)
+    then: {kind: skip, reason: matched}
+  - id: fallthrough
+    when: "true"
+    then: {kind: skip, reason: unmatched}
+"#,
+        );
+        assert_eq!(
+            decide_with(&rules, &facts_with_requested_action()).expect("eval should succeed"),
+            Decision::Skip("matched".into())
+        );
+        assert_eq!(
+            decide_with(&rules, &base_facts()).expect("eval should succeed"),
+            Decision::Skip("unmatched".into())
+        );
+    }
+
+    #[test]
+    fn act_requested_actions_is_rejected_inside_act_all() {
+        let yaml = "rules:\n  - id: x\n    when: \"true\"\n    then: {kind: act_all, actions: [{kind: act_requested_actions}]}\n";
+        let err = CompiledRules::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, RuleCompileError::Yaml(_)), "{err:?}");
+    }
+
+
+            fn rule_index(ids: &[String], id: &str) -> usize {
+        ids.iter()
+            .position(|r| r == id)
+            .unwrap_or_else(|| panic!("rule {id:?} missing; got {ids:?}"))
+    }
+
+    #[test]
+    fn baked_in_generic_rule_sits_directly_above_each_terminal_rule() {
+        let cache = RulesCache::new();
+        let user_ids = cache.status(EntityType::User, None).rule_ids;
+        let generic = rule_index(&user_ids, "act_requested_actions");
+        let guard = rule_index(&user_ids, "platform_row_without_requested_actions");
+        let terminal = rule_index(&user_ids, "act_suspend");
+        assert_eq!(terminal, user_ids.len() - 1, "act_suspend must be last");
+        assert_eq!(
+            generic,
+            terminal - 1,
+            "generic rule must sit directly above act_suspend"
+        );
+        assert_eq!(
+            guard,
+            generic - 1,
+            "empty-list guard must sit directly above the generic rule"
+        );
+        assert!(generic > rule_index(&user_ids, "pagerank_skipped"));
+
+        let post_ids = cache.status(EntityType::Post, None).rule_ids;
+        let generic = rule_index(&post_ids, "act_requested_actions");
+        let terminal = rule_index(&post_ids, "post_no_actionable_label");
+        assert_eq!(
+            terminal,
+            post_ids.len() - 1,
+            "post terminal skip must be last"
+        );
+        assert_eq!(
+            generic,
+            terminal - 1,
+            "generic rule must sit directly above the post terminal skip"
+        );
+        assert!(generic > rule_index(&post_ids, "pagerank_skipped"));
+    }
+
+    #[test]
+    fn baked_in_user_pipeline_routes_requested_actions_to_generic_dispatch() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        assert_eq!(
+            decide_with(&rules, &facts_with_requested_action()).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+        assert_eq!(
+            decide_with(&rules, &base_facts()).expect("eval should succeed"),
+            Decision::Act(vec![ActionSpec::SuspendUser {
+                perm: false,
+                policy: "PlatformManipulation".into(),
+            }])
+        );
+    }
+
+    #[test]
+    fn baked_in_user_platform_label_with_empty_list_skips_not_suspends() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = base_facts();
+        f.score
+            .labels
+            .push("abuse_platform_requested_actions".into());
+        assert_eq!(
+            decide_with(&rules, &f).expect("eval should succeed"),
+            Decision::Skip("platform_row_without_requested_actions".into())
+        );
+        let mut f = facts_with_requested_action();
+        f.score
+            .labels
+            .push("abuse_platform_requested_actions".into());
+        assert_eq!(
+            decide_with(&rules, &f).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+    }
+
+    #[test]
+    fn baked_in_user_guardrails_still_win_over_generic_dispatch() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = facts_with_requested_action();
+        f.user_allowlist_mut().is_allowlisted = true;
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("user_in_allowlist".into())
+        );
+        let mut f = facts_with_requested_action();
+        f.cred_mut().follower_count = Some(5_000);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("high_follower_count".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_user_pipeline_splits_follower_bands_at_the_ceiling() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = facts_with_requested_action();
+        f.cred_mut().follower_count = Some(250_000);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("very_high_follower_count".into())
+        );
+        f.cred_mut().follower_count = Some(50_000);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("high_follower_count".into())
+        );
+        f.cred_mut().follower_count = Some(500);
+        assert_ne!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("high_follower_count".into())
+        );
+        assert_ne!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("very_high_follower_count".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_user_ceiling_ignores_skip_author_credibility_prechecks() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = facts_with_requested_action();
+        f.cred_mut().follower_count = Some(250_000);
+        f.score.skip_author_credibility_prechecks = true;
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("very_high_follower_count".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_post_pipeline_routes_requested_actions_to_generic_dispatch() {
+        let rules = RulesCache::new().resolve(EntityType::Post, None);
+        let mut f = post_facts(safe_author(), vec![]);
+        f.score.requested_actions = vec![crate::facts::RequestedActionFacts {
+            kind: "post_label".into(),
+            labels: vec!["SpamHighRecall".into()],
+            head: "IsSpamPost".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            decide_with(&rules, &f).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+        assert_eq!(
+            decide_with(&rules, &post_facts(safe_author(), vec![])).unwrap(),
+            Decision::Skip("post_no_actionable_label".into())
+        );
+        let mut author = safe_author();
+        author.cred.is_high = Some(true);
+        let mut f = post_facts(author, vec![]);
+        f.score.requested_actions = vec![crate::facts::RequestedActionFacts {
+            kind: "post_label".into(),
+            labels: vec!["SpamHighRecall".into()],
+            ..Default::default()
+        }];
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("pagerank_skipped".into())
+        );
+    }
+
+
     #[test]
     fn mock_user_allowlisted_skips() {
         let mut f = base_facts();
@@ -1101,14 +1398,14 @@ rules:
     #[test]
     fn mock_cred_follower_count_skips() {
         let mut f = base_facts();
-        f.cred_mut().follower_count = Some(1234); 
+        f.cred_mut().follower_count = Some(1234);
         assert_eq!(d(&f), Decision::Skip("cred_skip".into()));
     }
 
     #[test]
     fn mock_cred_score_skips() {
         let mut f = base_facts();
-        f.cred_mut().score = Some(7.5); 
+        f.cred_mut().score = Some(7.5);
         assert_eq!(d(&f), Decision::Skip("cred_skip".into()));
     }
 

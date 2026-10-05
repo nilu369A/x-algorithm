@@ -51,7 +51,19 @@ def suicide_or_self_harm_policy_prompt() -> str:
     return _env.get_template("suicide_or_self_harm_policy.j2").render()
 
 
+@cache
+def age_gating_harmful_text_policy_prompt() -> str:
+    return _env.get_template("age_gating_harmful_text_policy.j2").render()
+
+
 def child_safety_policy_prompt(post_creation_time: str) -> str:
     return _env.get_template("child_safety_policy.j2").render(
         post_creation_time=post_creation_time
     )
+
+
+@cache
+def media_injected_adult_infrared_video_spam_detection_prompt() -> str:
+    return _env.get_template(
+        "media_injected_adult_infrared_video_spam_detection.j2"
+    ).render()

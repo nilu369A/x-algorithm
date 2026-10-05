@@ -1,6 +1,7 @@
 import os
 import logging
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, BaseModel, ConfigDict
 from monitor.config import LoggingConfig, MetricsConfig
@@ -86,9 +87,9 @@ class ModelName:
     GROK_4_MINI_CRITICAL_SAFETY = "critical-safety"
     EAPI_GROK_420_REASONING_X_ALGO = "eapi-grok-420-reasoning-x-algo"
     EAPI_GROK_420_REASONING_INTERNAL = "eapi-grok-420-reasoning-internal"
+    EAPI_GROK_4_1_FAST_X_ALGO = "eapi-grok-4-1-fast-x-algo"
     EAPI_GROK_4_3_INTERNAL = "eapi-grok-4-3-internal"
     EAPI_GROK_4_3_X_ALGO = "eapi-grok-4-3-x-algo"
-    EAPI_GROK_4_5_INTERNAL = "eapi-grok-4-5-internal"
     EAPI_GROK_4_5_X_ALGO = "eapi-grok-4-5-x-algo"
     EAPI_GROK_4_6_INTERNAL = "eapi-grok-4-6-internal"
 
@@ -111,10 +112,23 @@ class MediaHydrationConfig(BaseModel):
     image_tile_size: int = 448
     enable_light_dark_enhancement: bool = False
     enable_clahe_enhancement: bool = False
+    enable_motion_reveal: bool = False
+    enable_local_broadcast_frame_extraction: bool = False
+    enable_video_preview_image: bool = False
     deluxe_fav_count_threshold: int = 64
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600
     deluxe_image_tile_size: int = 600
+    use_key_frames: bool = False
+    shot_key_frames_window_seconds: float = 3.0
+    shot_key_frames_max_fps: float = 15.0
+    shot_key_frames_max: int = 3
+    key_frames_video_max_frames: int = 0
+    embedding_ranked_key_frames: bool = False
+    embedding_ranked_key_frames_max_seconds: float = 5.0
+    embedding_ranked_key_frames_model: str = "recsys-v5-embedding"
+    embedding_ranked_key_frames_embed_size: int = 336
+    embedding_ranked_key_frames_min_score: float | None = None
 
 
 class GroxKafkaLoaderConfig(BaseModel):
@@ -196,6 +210,13 @@ class PromptTokensConfig(BaseModel):
     image_pad: str = ""
 
 
+class MediaReferenceBundleConfig(BaseModel):
+    model_config = _FROZEN
+
+    uri: str
+    refresh_interval_s: int = 900
+
+
 class GroxConfig(BaseSettings):
     metrics: MetricsConfig = MetricsConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -206,6 +227,9 @@ class GroxConfig(BaseSettings):
     eapi_models: dict[str, EapiModelConfig] = Field(default_factory=dict)
     oai_models: dict[str, OaiModelConfig] = Field(default_factory=dict)
     media_hydration: MediaHydrationConfig = MediaHydrationConfig()
+    media_reference_bundles: dict[str, MediaReferenceBundleConfig] = Field(
+        default_factory=dict
+    )
     product_media: ProductMediaConfig = ProductMediaConfig()
     nightowl: NightOwlConfig | None = NightOwlConfig()
     kafka_producer_topics: dict[str, KafkaProducerConfig] = Field(default_factory=dict)
@@ -223,6 +247,7 @@ class GroxConfig(BaseSettings):
     kerberos: KerberosConfig = KerberosConfig()
     asr: ASRConfig = ASRConfig()
     prompt_tokens: PromptTokensConfig = PromptTokensConfig()
+    enrichment_write: Literal["mh", "both_mh"] = "mh"
 
     model_config = SettingsConfigDict(yaml_file=_get_config_file_paths(), frozen=True)
 

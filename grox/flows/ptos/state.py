@@ -19,6 +19,7 @@ class SafetyPolicyCategory(str, Enum):
     ViolentMedia = "ViolentMedia"
     TerrorismOrViolentExtremism = "TerrorismOrViolentExtremism"
     CivicIntegrity = "CivicIntegrity"
+    AgeGatingHarmfulText = "AgeGatingHarmfulText"
 
 
 class SafetyPolicyType(str, Enum):
@@ -40,6 +41,7 @@ class SafetyPolicyType(str, Enum):
     SpamEngagementBaiting = "SpamEngagementBaiting"
     SpamCardManipulation = "SpamCardManipulation"
     SpamMentionAbuse = "SpamMentionAbuse"
+    SpamManipulatedMedia = "SpamManipulatedMedia"
     IllegalAndRegulatedBehaviorsSexualServices = (
         "IllegalAndRegulatedBehaviorsSexualServices"
     )
@@ -68,6 +70,11 @@ class SafetyPolicyType(str, Enum):
     SuicideOrSelfHarmExpressingDesire = "SuicideOrSelfHarmExpressingDesire"
     ChildSafetySexualAbuseMaterial = "ChildSafetySexualAbuseMaterial"
     ChildSafetySexualExploitation = "ChildSafetySexualExploitation"
+    AgeGatingHarmfulTextAdultContent = "AgeGatingHarmfulTextAdultContent"
+    AgeGatingHarmfulTextEatingDisorder = "AgeGatingHarmfulTextEatingDisorder"
+    AgeGatingHarmfulTextHarmfulSubstance = "AgeGatingHarmfulTextHarmfulSubstance"
+    AgeGatingHarmfulTextDangerousStunt = "AgeGatingHarmfulTextDangerousStunt"
+    AgeGatingHarmfulTextGraphicDescription = "AgeGatingHarmfulTextGraphicDescription"
 
 
 class SafetyPolicy(BaseModel):
@@ -88,7 +95,6 @@ class SafetyPostAnnotations(BaseModel):
 
 
 class SafemodelResult(BaseModel):
-    scored: bool = False
     positive: bool = False
     confidence: float = 0.0
 

@@ -1,5 +1,6 @@
 import <visibility/under-the-hood/sharedConfig>
 import <visibility/under-the-hood/underTheHoodLabels>
+import <visibility/under-the-hood/params>
 
 type Key = Long
 type View = Unit
@@ -11,6 +12,7 @@ type UthDayCount = com.twitter.visibility.under_the_hood.UthDayCount
 type UthUserMonthKey = com.twitter.visibility.under_the_hood.UthUserMonthKey
 type UthDaysIncluded = com.twitter.visibility.under_the_hood.UthDaysIncluded
 type User = com.twitter.gizmoduck.User
+type RichText = com.twitter.timelines.render.RichText
 
 val metadataUserId = -1L
 val minimumAccountAge = 365.days
@@ -32,9 +34,70 @@ val englishMonthNames = Seq(
   "November",
   "December",
 )
-val reportNotes =
-  "You can learn more about instances when a post’s reach may be limited by reading our open-source code at https://github.com/xai-org/x-algorithm and the guide at https://help.x.com/rules-and-policies/x-reach-limited. Learn more about account and post-level enforcement options here https://help.x.com/rules-and-policies/enforcement-options. " +
-    "This report is provided on a best-effort basis — the code that generates it is open-source: https://github.com/xai-org/x-algorithm/tree/main/under-the-hood"
+type RichTextEntity = com.twitter.timelines.render.RichTextEntity
+type NoteSpan = {
+  text: String,
+  url: Option[String]
+}
+type NoteBuild = {
+  text: String,
+  entities: Seq[RichTextEntity]
+}
+
+val noteSpans: Seq[NoteSpan] = Seq(
+  {
+    text = "You can learn more about instances when a post’s reach may be limited by reading our ",
+    url = None : Option[String],
+  },
+  { text = "open-source code", url = Some("https://github.com/xai-org/x-algorithm") },
+  { text = " and ", url = None : Option[String] },
+  { text = "guide", url = Some("https://help.x.com/rules-and-policies/x-reach-limited") },
+  {
+    text = ". Learn more about account and post-level ",
+    url = None : Option[String],
+  },
+  { text = "enforcement options", url = Some("https://help.x.com/rules-and-policies/enforcement-options") },
+  {
+    text = ". This report is provided on a best-effort basis — the code that generates it is ",
+    url = None : Option[String],
+  },
+  { text = "open-source", url = Some("https://github.com/xai-org/x-algorithm/tree/main/under-the-hood") },
+)
+
+val reportNoteString = noteSpans.foldLeft("") { (acc, span) =>
+  span.url match {
+    case Some(url) => acc + span.text + " (" + url + ")"
+    case None => acc + span.text
+  }
+}
+
+def linkEntity(fromIndex: Int, linkText: String, url: String): RichTextEntity = {
+  fromIndex = fromIndex,
+  toIndex = fromIndex + linkText.length,
+  ref = Some(Url({
+    url = url,
+    urlType = ExternalUrl,
+  })),
+}
+
+def reportNote(): RichText = {
+  val built = noteSpans.foldLeft[NoteBuild]({ text = "", entities = Seq.empty[RichTextEntity] }) { (acc, span) =>
+    span.url match {
+      case Some(url) => {
+        text = acc.text + span.text,
+        entities = acc.entities ++ Seq(linkEntity(acc.text.length, span.text, url)),
+      }
+      case None => {
+        text = acc.text + span.text,
+        entities = acc.entities,
+      }
+    }
+  }
+  {
+    text = built.text,
+    entities = built.entities,
+  }
+}
 
 val utcYyyyMm = TimeFormat.apply("yyyyMM").withZone("UTC")
 val utcYyyyMmDd = TimeFormat.apply("yyyy-MM-dd").withZone("UTC")
@@ -86,12 +149,18 @@ def monthPublishCalendarReady(monthBucket: Int, now: Time.T): Boolean = {
   now.inMillis >= monthEndStart.plus(minDaysAfterMonthEnd.days).inMillis
 }
 
-def reportMonthBucket(now: Time.T): Int = {
+def reportMonthBucket(now: Time.T, maxMonthBucket: Int): Int = {
   val candidate = calendarMonthBefore(now)
-  if (monthPublishCalendarReady(candidate, now)) {
-    candidate
+  val calendarMonth =
+    if (monthPublishCalendarReady(candidate, now)) {
+      candidate
+    } else {
+      monthBucketBefore(candidate)
+    }
+  if (maxMonthBucket > 0 && calendarMonth > maxMonthBucket) {
+    maxMonthBucket
   } else {
-    monthBucketBefore(candidate)
+    calendarMonth
   }
 }
 
@@ -170,11 +239,84 @@ def formatPercentage(numerator: Long, denominator: Long): String = {
   }
 }
 
+def postLabelRow(
+    raw: String,
+    countryCodes: Seq[String],
+    carried: Long,
+    postCount: Long,
+    includeTakedowns: Boolean
+): Option[{
+  label: String,
+  about: String,
+  effect: String,
+  posts: Long,
+  totalPostsInMonth: Long,
+  percentageOfPosts: String
+}] =
+  if (underTheHoodLabels.isPostLabel(raw)) {
+    Some({
+      label = underTheHoodLabels.postLabelName(raw),
+      about = underTheHoodLabels.postLabelAbout(raw),
+      effect = underTheHoodLabels.postLabelEffect(raw),
+      posts = carried,
+      totalPostsInMonth = postCount,
+      percentageOfPosts = formatPercentage(carried, postCount),
+    })
+  } else if (includeTakedowns && underTheHoodLabels.isPostTakedownLabel(raw, countryCodes)) {
+    Some({
+      label = underTheHoodLabels.takedownLabelName(raw, countryCodes),
+      about = underTheHoodLabels.postTakedownAbout(raw, countryCodes),
+      effect = underTheHoodLabels.postTakedownEffect(raw, countryCodes),
+      posts = carried,
+      totalPostsInMonth = postCount,
+      percentageOfPosts = formatPercentage(carried, postCount),
+    })
+  } else {
+    None
+  }
+
+def accountLabelRow(
+    raw: String,
+    countryCodes: Seq[String],
+    days: Long,
+    periodDays: Int,
+    includeTakedowns: Boolean
+): Option[{
+  label: String,
+  about: String,
+  effect: String,
+  days: Long,
+  daysInPeriod: Int,
+  percentageOfDays: String
+}] =
+  if (underTheHoodLabels.isAccountLabel(raw)) {
+    Some({
+      label = underTheHoodLabels.accountLabelName(raw),
+      about = underTheHoodLabels.accountLabelAbout(raw),
+      effect = underTheHoodLabels.accountLabelEffect(raw),
+      days = days,
+      daysInPeriod = periodDays,
+      percentageOfDays = formatPercentage(days, periodDays.toLong),
+    })
+  } else if (includeTakedowns && underTheHoodLabels.isAccountTakedownLabel(raw, countryCodes)) {
+    Some({
+      label = underTheHoodLabels.takedownLabelName(raw, countryCodes),
+      about = underTheHoodLabels.accountTakedownAbout(raw, countryCodes),
+      effect = underTheHoodLabels.accountTakedownEffect(raw, countryCodes),
+      days = days,
+      daysInPeriod = periodDays,
+      percentageOfDays = formatPercentage(days, periodDays.toLong),
+    })
+  } else {
+    None
+  }
+
 def buildReportJson(
     userMonth: UthUserMonthAggregate,
     monthBucket: Int,
     generatedAtMs: Long,
-    periodDays: Int
+    periodDays: Int,
+    includeTakedowns: Boolean
 ): String = {
   val postCount = userMonth.eligiblePostAgg
     .map { days => sumDayCounts(Some(days)) }
@@ -188,38 +330,33 @@ def buildReportJson(
   val postLabels = userMonth.postLabelAgg
     .getOrElse(Seq.empty)
     .flatMap { agg =>
-      agg.label.filter(underTheHoodLabels.isPostLabel).map { raw =>
-        val posts = sumCarried(agg.days)
-        {
-          label = underTheHoodLabels.postLabelName(raw),
-          about = underTheHoodLabels.postLabelAbout(raw),
-          effect = underTheHoodLabels.postLabelEffect(raw),
-          posts = posts,
-          totalPostsInMonth = postCount,
-          percentageOfPosts = formatPercentage(posts, postCount),
-        }
+      agg.label.flatMap { raw =>
+        postLabelRow(
+          raw,
+          agg.countryCodes.getOrElse(Seq.empty),
+          sumCarried(agg.days),
+          postCount,
+          includeTakedowns)
       }
     }
 
   val accountLabels = userMonth.accountLabelAgg
     .getOrElse(Seq.empty)
     .flatMap { agg =>
-      agg.label.filter(underTheHoodLabels.isAccountLabel).map { raw =>
+      agg.label.flatMap { raw =>
         val days = agg.activeDays.map { d => d.size.toLong }.getOrElse(0L)
-        {
-          label = underTheHoodLabels.accountLabelName(raw),
-          about = underTheHoodLabels.accountLabelAbout(raw),
-          effect = underTheHoodLabels.accountLabelEffect(raw),
-          days = days,
-          daysInPeriod = periodDays,
-          percentageOfDays = formatPercentage(days, periodDays.toLong),
-        }
+        accountLabelRow(
+          raw,
+          agg.countryCodes.getOrElse(Seq.empty),
+          days,
+          periodDays,
+          includeTakedowns)
       }
     }
 
   if (postLabels.isEmpty && accountLabels.isEmpty) {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -230,7 +367,7 @@ def buildReportJson(
     }.toJson
   } else if (postLabels.isEmpty) {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -240,7 +377,7 @@ def buildReportJson(
     }.toJson
   } else if (accountLabels.isEmpty) {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -250,7 +387,7 @@ def buildReportJson(
     }.toJson
   } else {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -305,7 +442,8 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
       meetsAccountAgeMinimum(user, now)
     }).getOrElse(false)
 
-  val primaryMonth = reportMonthBucket(now)
+  val primaryMonth = reportMonthBucket(now, params.underTheHoodReportMaxMonthBucket())
+  val includeTakedowns = params.underTheHoodReportTakedownsEnabled()
   val primaryUserKey: UthUserMonthKey = {
     userId = ctx.key,
     monthBucket = primaryMonth,
@@ -351,6 +489,7 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
                 postsCheckLabel -> false,
                 ageCheckLabel -> ageOk,
               )),
+              note = Some(reportNote()),
             }
             Ok.value(Some({
               reportJson = None,
@@ -374,12 +513,13 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
         val reportInfo = {
           reportPeriod = Some(reportPeriodLabel(monthBucket)),
           eligibilityChecks = Some(eligibilityChecks),
+          note = Some(reportNote()),
         }
         val generatedAtMs = generatedAtMillis(daysIncludedForTs, now.inMillis)
         val periodDays = daysInPeriod(monthBucket, daysIncludedForTs)
         val reportJson =
           if (ageOk && hasEnoughPosts) {
-            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays))
+            Some(buildReportJson(userMonth, monthBucket, generatedAtMs, periodDays, includeTakedowns))
           } else {
             None
           }
@@ -405,8 +545,10 @@ Managed({
   }),
   description = PlainText(
     "Per-user Under the Hood transparency report (keyed by user id). " +
-      "Picks the latest prior UTC month past the 10-day calendar floor (keep at 10+); if that " +
-      "month lacks complete observation (finalThroughDay), falls back one month. " +
+      "Picks the latest prior UTC month past the 10-day calendar floor (keep at 10+), capped by FS " +
+      "under_the_hood_report_max_month_bucket when > 0; if that month lacks complete observation " +
+      "(finalThroughDay), falls back one month. Takedown rows (label = reason name + countryCodes) in " +
+      "postLabelAgg / accountLabelAgg render only when FS under_the_hood_report_takedowns_enabled. " +
       "Uses the per-user row when present; if missing, userId=-1 month-meta can still return " +
       "reportInfo without reportJson. Missing only when both user and meta are absent/incomplete. " +
       "eligibilityChecks = posts/age only. Called by underTheHoodReport for the authenticated viewer."

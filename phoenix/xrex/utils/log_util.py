@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from xai_logging_utils.structured import format_extra_kv
 from xrex.utils import cluster
 
 if TYPE_CHECKING:
@@ -82,7 +83,11 @@ def get_formatter(
             if row:
                 attr += f"/row={row}"
             record.rl_attr = attr
+            extra_kv = format_extra_kv(record)
             msg = super().format(record)
+            if extra_kv:
+                head, sep, tail = msg.partition("\n")
+                msg = f"{head}  {extra_kv}{sep}{tail}"
             color = LEVEL_COLORS.get(record.levelno)
             if color:
                 if msg.startswith(faint):

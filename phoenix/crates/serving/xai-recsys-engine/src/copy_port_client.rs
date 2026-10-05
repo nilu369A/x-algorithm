@@ -2,19 +2,21 @@
 // Copyright 2026 X.AI Corp.
 use std::cmp;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::mem;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
-#[cfg(target_os = "linux")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, join_all};
 use lazy_static::lazy_static;
 use rand::prelude::*;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 use crate::adler32::adler32_combine;
-use crate::emb_table::{get_channels_list_entries, send_entries};
+use crate::emb_table::{get_channels_with_endpoints, list_entries, send_entries};
 use crate::grpc_util::TRANSFER_FAILED_SENTINEL;
 
 pub struct TensorBuf<'a> {
@@ -155,9 +157,16 @@ fn parse_elapsed_from_prefix(prefix: &str) -> Option<u64> {
 }
 
 fn newest_full_prefix(entries: &[Vec<(String, usize)>]) -> String {
+    full_prefixes_newest_first(entries)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn full_prefixes_newest_first(entries: &[Vec<(String, usize)>]) -> Vec<String> {
     let n_active = entries.iter().filter(|e| !e.is_empty()).count();
     if n_active == 0 {
-        return String::new();
+        return Vec::new();
     }
     let mut counts = BTreeMap::<&str, usize>::new();
     for entry_list in entries {
@@ -177,13 +186,12 @@ fn newest_full_prefix(entries: &[Vec<(String, usize)>]) -> String {
             }
         }
     }
-    let mut prefix = "";
-    for (name, count) in &counts {
-        if *count == n_active {
-            prefix = name;
-        }
-    }
-    prefix.to_string()
+    counts
+        .into_iter()
+        .rev()
+        .filter(|(_, count)| *count == n_active)
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 fn is_newer_prefix(prefix: &str, elapsed_samples: u64) -> bool {
@@ -208,16 +216,23 @@ fn set_or_check(slot: &mut usize, value: usize, what: &str) -> Result<(), CopyPo
 async fn connect_and_list(
     urls: &str,
     list_prefix: String,
-) -> Result<(Vec<Channel>, Vec<Vec<(String, usize)>>), CopyPortError> {
+) -> Result<(Vec<Channel>, Vec<Vec<(String, usize)>>, Vec<Endpoint>), CopyPortError> {
     let urls = resolve_copy_urls(urls).await?;
-    let (channels, entries) = get_channels_list_entries(urls, list_prefix)
+    let (channels, endpoints): (Vec<_>, Vec<_>) = get_channels_with_endpoints(urls)
+        .await
+        .map_err(|s| CopyPortError::Grpc(s.message().to_string()))?
+        .into_iter()
+        .unzip();
+    let entries = list_entries(&channels, &list_prefix)
         .await
         .map_err(|s| CopyPortError::Grpc(s.message().to_string()))?;
-    let (channels, entries): (Vec<_>, Vec<_>) = channels
+    let (sources, entries): (Vec<_>, Vec<_>) = channels
         .into_iter()
+        .zip(endpoints)
         .zip(entries)
         .filter(|(_, e)| !e.is_empty())
         .unzip();
+    let (channels, endpoints): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
     if channels.is_empty() {
         return Err(CopyPortError::Grpc(
             "no copy_port channels connected".into(),
@@ -227,29 +242,97 @@ async fn connect_and_list(
         "copy_port: {} channel(s) with non-empty listings",
         channels.len()
     );
-    Ok((channels, entries))
+    Ok((channels, entries, endpoints))
 }
 
 type TransferFuture = BoxFuture<'static, (usize, u32)>;
 type DenseDownloadPlan = (Vec<TransferFuture>, Vec<usize>, Vec<u8>);
+
+type IndexedTransfer = Result<(usize, (usize, u32)), CopyPortError>;
+
+struct TransferSlot(Mutex<Option<TransferFuture>>);
+
+impl TransferSlot {
+    fn poll(&self, cx: &mut std::task::Context<'_>) -> Poll<Result<(usize, u32), CopyPortError>> {
+        let mut future = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            future.as_mut().map(|future| future.as_mut().poll(cx))
+        }));
+        if matches!(result, Ok(Some(Poll::Pending))) {
+            return Poll::Pending;
+        }
+        let dropped = catch_unwind(AssertUnwindSafe(|| drop(future.take())));
+        Poll::Ready(match (result, dropped) {
+            (Ok(Some(Poll::Ready(result))), Ok(())) => Ok(result),
+            (Ok(None), Ok(())) => Err(CopyPortError::Other("copy_port download cancelled".into())),
+            _ => Err(CopyPortError::Other(
+                "copy_port download task panicked".into(),
+            )),
+        })
+    }
+}
+
+#[derive(Default)]
+struct ActiveTransfers {
+    slots: Vec<Arc<TransferSlot>>,
+    tasks: tokio::task::JoinSet<IndexedTransfer>,
+}
+
+impl ActiveTransfers {
+    fn push(&mut self, index: usize, future: TransferFuture) {
+        let slot = Arc::new(TransferSlot(Mutex::new(Some(future))));
+        self.slots.push(slot.clone());
+        self.tasks.spawn(std::future::poll_fn(move |cx| {
+            slot.poll(cx)
+                .map(|result| result.map(|result| (index, result)))
+        }));
+    }
+}
+
+impl Drop for ActiveTransfers {
+    fn drop(&mut self) {
+        let mut panicked = false;
+        for slot in &self.slots {
+            let mut future = slot.0.lock().unwrap_or_else(|error| error.into_inner());
+            panicked |= catch_unwind(AssertUnwindSafe(|| drop(future.take()))).is_err();
+        }
+        self.tasks.abort_all();
+        if panicked {
+            log::error!(
+                "copy_port: transfer destructor panicked; all active futures were cleaned up"
+            );
+        }
+    }
+}
 
 async fn run_downloads(
     futures: Vec<TransferFuture>,
     rate_limit_bytes_per_sec: Option<u64>,
     max_concurrent_downloads: Option<usize>,
 ) -> Result<Vec<(usize, u32)>, CopyPortError> {
-    if futures.is_empty() {
-        return Ok(Vec::new());
+    let limit = rate_limit_bytes_per_sec.unwrap_or(0);
+    let max_concurrent = if limit == 0 {
+        futures.len()
+    } else {
+        max_concurrent_downloads.unwrap_or(futures.len())
+    };
+    join_rate_limited(futures, limit, max_concurrent).await
+}
+
+fn pacing_sleep(total_bytes: u64, rate: u64, elapsed: Duration) -> Duration {
+    if rate == 0 {
+        return Duration::ZERO;
     }
-    match rate_limit_bytes_per_sec {
-        Some(limit) if limit > 0 => {
-            let max_c = max_concurrent_downloads
-                .unwrap_or(futures.len().max(1))
-                .max(1);
-            join_rate_limited(futures, limit, max_c).await
-        }
-        _ => Ok(join_all(futures).await),
+    let expected =
+        Duration::try_from_secs_f64(total_bytes as f64 / rate as f64).unwrap_or(Duration::MAX);
+    let sleep = expected.saturating_sub(elapsed);
+    if sleep > MAX_PACING_SLEEP {
+        log::warn!(
+            "rate_limiter: pacing sleep for {total_bytes} bytes exceeds \
+             {MAX_PACING_SLEEP:?}; capping"
+        );
     }
+    sleep.min(MAX_PACING_SLEEP)
 }
 
 async fn join_rate_limited(
@@ -257,66 +340,66 @@ async fn join_rate_limited(
     rate_limit_bytes_per_sec: u64,
     max_concurrent: usize,
 ) -> Result<Vec<(usize, u32)>, CopyPortError> {
+    if futures.is_empty() {
+        return Ok(Vec::new());
+    }
     let max_concurrent = max_concurrent.max(1);
-    let start = Instant::now();
-    let mut total_bytes: u64 = 0;
-    let mut results = Vec::with_capacity(futures.len());
-    let mut iter = futures.into_iter();
-    loop {
-        let batch: Vec<_> = iter.by_ref().take(max_concurrent).collect();
-        if batch.is_empty() {
-            break;
-        }
-        let batch_size = batch.len();
-        let batch_results = join_all(batch).await;
-        let failed = batch_results
-            .iter()
-            .filter(|r| r.0 == TRANSFER_FAILED_SENTINEL)
-            .count();
-        if failed > 0 {
-            log::error!(
-                "rate_limiter: {failed}/{batch_size} transfers in batch failed; \
-                 skipping remaining downloads so the caller can fail and retry"
-            );
-            results.extend(batch_results);
-            return Ok(results);
-        }
-        let mut batch_bytes: u64 = 0;
-        for result in batch_results {
-            batch_bytes = batch_bytes.saturating_add(result.0 as u64);
-            results.push(result);
-        }
-        total_bytes = total_bytes.saturating_add(batch_bytes);
-        let elapsed = start.elapsed();
-        let expected =
-            Duration::try_from_secs_f64(total_bytes as f64 / rate_limit_bytes_per_sec as f64)
-                .unwrap_or(Duration::MAX);
-        let sleep = expected.saturating_sub(elapsed);
-        let (sleep, clamped) = if sleep > MAX_PACING_SLEEP {
-            (MAX_PACING_SLEEP, true)
-        } else {
-            (sleep, false)
-        };
-        if clamped {
-            log::warn!(
-                "rate_limiter: pacing sleep for {total_bytes} bytes exceeds \
-                 {MAX_PACING_SLEEP:?}; capping"
-            );
-        }
-        if !sleep.is_zero() {
-            log::info!(
-                "rate_limiter: batch of {batch_size} downloaded {:.2} GiB \
-                 ({:.2} GiB total) in {:.2}s, sleeping {:.2}s under {:.2} GiB/s",
-                batch_bytes as f64 / (1u64 << 30) as f64,
-                total_bytes as f64 / (1u64 << 30) as f64,
-                elapsed.as_secs_f64(),
-                sleep.as_secs_f64(),
-                rate_limit_bytes_per_sec as f64 / (1u64 << 30) as f64,
-            );
-            tokio::time::sleep(sleep).await;
+    let start = tokio::time::Instant::now();
+    let mut next_start = start;
+    let mut total_bytes = 0u64;
+    let mut results = vec![None; futures.len()];
+    let mut remaining = futures.into_iter().enumerate();
+    let mut active = ActiveTransfers::default();
+    let mut failed = false;
+    let mut join_error = None;
+    for (index, future) in remaining.by_ref().take(max_concurrent) {
+        active.push(index, future);
+    }
+
+    while !active.tasks.is_empty() || (!failed && remaining.len() > 0) {
+        tokio::select! {
+            biased;
+            Some(joined) = active.tasks.join_next(), if !active.tasks.is_empty() => {
+                match joined.unwrap_or_else(|error| {
+                    Err(CopyPortError::Other(format!("copy_port download task join: {error}")))
+                }) {
+                    Ok((index, result)) => {
+                        results[index] = Some(result);
+                        if result.0 == TRANSFER_FAILED_SENTINEL {
+                            failed = true;
+                        } else if !failed {
+                            total_bytes = total_bytes.saturating_add(result.0 as u64);
+                            let now = tokio::time::Instant::now();
+                            next_start = now + pacing_sleep(
+                                total_bytes, rate_limit_bytes_per_sec, now - start,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        failed = true;
+                        join_error.get_or_insert(error);
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(next_start),
+                if !failed && remaining.len() > 0 && active.tasks.len() < max_concurrent =>
+            {
+                let (index, future) = remaining.next().expect("queued transfer");
+                active.push(index, future);
+            }
         }
     }
-    Ok(results)
+    if let Some(error) = join_error {
+        return Err(error);
+    }
+    if failed {
+        log::error!(
+            "rate_limiter: transfer failed; drained active downloads and skipped queued work"
+        );
+    } else {
+        tokio::time::sleep_until(next_start).await;
+    }
+    Ok(results.into_iter().flatten().collect())
 }
 
 fn check_transfer_results(
@@ -349,7 +432,7 @@ pub async fn probe_newer_checkpoint(
     elapsed_samples: u64,
     urls: &str,
 ) -> Result<Option<(String, u64)>, CopyPortError> {
-    let (_channels, entries) = connect_and_list(urls, String::new()).await?;
+    let (_channels, entries, _) = connect_and_list(urls, String::new()).await?;
     let prefix = newest_full_prefix(&entries);
     if !is_newer_prefix(&prefix, elapsed_samples) {
         return Ok(None);
@@ -385,9 +468,9 @@ pub async fn download_dense_weight(
     max_concurrent_downloads: Option<usize>,
     target_prefix: Option<&str>,
 ) -> Result<DownloadMeta, CopyPortError> {
-    let (channels, entries) = connect_and_list(urls, String::new()).await?;
+    let (channels, entries, _) = connect_and_list(urls, String::new()).await?;
     let prefix = choose_prefix(target_prefix, &entries)?;
-    if !is_newer_prefix(&prefix, elapsed_samples) {
+    if target_prefix.is_none() && !is_newer_prefix(&prefix, elapsed_samples) {
         return Err(CopyPortError::NoNewer {
             new_prefix: prefix,
             prev_prefix: format!("elapsed_samples_{elapsed_samples:018}/"),
@@ -426,8 +509,9 @@ pub async fn download_dense_and_embeddings(
     rate_limit_bytes_per_sec: Option<u64>,
     max_concurrent_downloads: Option<usize>,
 ) -> Result<(DownloadMeta, u32, Option<u32>), CopyPortError> {
+    let trainer_conns_per_source = crate::emb_table::trainer_conns_per_source();
     let t_all = Instant::now();
-    let (channels, entries) = connect_and_list(urls, String::new()).await?;
+    let (channels, entries, endpoints) = connect_and_list(urls, String::new()).await?;
     let prefix = newest_full_prefix(&entries);
     if !is_newer_prefix(&prefix, elapsed_samples) {
         return Err(CopyPortError::NoNewer {
@@ -440,10 +524,6 @@ pub async fn download_dense_and_embeddings(
     let index = index_dense_listing(&prefix, &entries[channel_idx]);
     let (futures, sizes, checksums_buf) =
         build_dense_downloads(&channels[channel_idx], &index, tensors)?;
-    log::info!(
-        "copy_port: downloading dense weights prefix={prefix} futures={}",
-        futures.len()
-    );
     let results =
         run_downloads(futures, rate_limit_bytes_per_sec, max_concurrent_downloads).await?;
     sfence_after_download();
@@ -454,9 +534,17 @@ pub async fn download_dense_and_embeddings(
         .ok()
         .and_then(|v| v.get("created_timestamp")?.as_f64())
         .unwrap_or(0.0);
+    let bytes: u64 = tensors.iter().map(|t| t.buf.len() as u64).sum();
+    let secs = t_all.elapsed().as_secs_f64();
+    let gbs = if secs > 0.0 {
+        bytes as f64 / secs / 1e9
+    } else {
+        0.0
+    };
     log::info!(
-        "copy_port: dense weights loaded prefix={prefix} in {:.2}s",
-        t_all.elapsed().as_secs_f64()
+        "copy_port: dense weights loaded bytes={bytes} in {:.2}s ({:.2} GB/s)",
+        secs,
+        gbs
     );
 
     let prefix_slash = if prefix.ends_with('/') {
@@ -477,10 +565,6 @@ pub async fn download_dense_and_embeddings(
         })
         .collect();
 
-    log::info!(
-        "copy_port: downloading emb_table prefix={prefix_slash} bytes={}",
-        emb.len()
-    );
     let t_emb = Instant::now();
     let emb_ck = download_sharded_with_channels(
         &channels,
@@ -490,12 +574,21 @@ pub async fn download_dense_and_embeddings(
         emb,
         rate_limit_bytes_per_sec,
         max_concurrent_downloads,
+        &endpoints,
+        trainer_conns_per_source,
     )
     .await?;
+    let secs = t_emb.elapsed().as_secs_f64();
+    let gbs = if secs > 0.0 {
+        emb.len() as f64 / secs / 1e9
+    } else {
+        0.0
+    };
     log::info!(
-        "copy_port: emb_table loaded bytes={} in {:.2}s",
+        "copy_port: emb_table loaded bytes={} in {:.2}s ({:.2} GB/s)",
         emb.len(),
-        t_emb.elapsed().as_secs_f64()
+        secs,
+        gbs
     );
 
     let pe_ck = if let Some(pe_buf) = pe.filter(|b| !b.is_empty()) {
@@ -512,6 +605,8 @@ pub async fn download_dense_and_embeddings(
                 pe_buf,
                 rate_limit_bytes_per_sec,
                 max_concurrent_downloads,
+                &endpoints,
+                trainer_conns_per_source,
             )
             .await?,
         )
@@ -538,14 +633,169 @@ async fn download_sharded_with_channels(
     buf: &mut [u8],
     rate_limit_bytes_per_sec: Option<u64>,
     max_concurrent_downloads: Option<usize>,
+    endpoints: &[Endpoint],
+    trainer_conns_per_source: usize,
 ) -> Result<u32, CopyPortError> {
     let layout = ShardedLayout::from_listing(name, entries)?;
     layout.check_buffer_size(name, buf.len())?;
-    let (futures, expected) = spawn_sharded_downloads(&layout, prefix, name, channels, buf).await?;
     let concurrent = max_concurrent_downloads.or(Some((channels.len() / 2).max(1)));
-    let results = run_downloads(futures, rate_limit_bytes_per_sec, concurrent).await?;
+    let mut connection_limit = trainer_conns_per_source.clamp(1, 16);
+    if connection_limit > 1 && std::env::var("XAI_RECSYS_RDMA").as_deref() == Ok("1") {
+        log::warn!("copy_port: trainer connections ignored while XAI_RECSYS_RDMA=1");
+        connection_limit = 1;
+    }
+    let trainer_opt_in =
+        connection_limit > 1 && matches!(layout.ownership, ShardOwnership::Sharded { .. });
+    let limit = if rate_limit_bytes_per_sec.is_some_and(|r| r > 0) {
+        concurrent
+    } else {
+        max_concurrent_downloads
+    };
+    let connection_limit = connection_limit.min(limit.unwrap_or(16).max(1));
+    let striped = trainer_opt_in && connection_limit > 1;
+    let (futures, expected, schedule) = if striped {
+        spawn_striped_trainer_downloads(
+            &layout,
+            prefix,
+            name,
+            channels,
+            endpoints,
+            buf,
+            connection_limit,
+        )
+        .await?
+    } else {
+        spawn_sharded_downloads(&layout, prefix, name, channels, buf).await?
+    };
+    let results = if trainer_opt_in
+        && rate_limit_bytes_per_sec.is_none_or(|r| r == 0)
+        && let Some(limit) = max_concurrent_downloads
+    {
+        let mut results = Vec::new();
+        let mut iter = futures.into_iter();
+        loop {
+            let batch: Vec<_> = iter.by_ref().take(limit.max(1)).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let batch = run_downloads(batch, None, None).await?;
+            let failed = batch.iter().any(|r| r.0 == TRANSFER_FAILED_SENTINEL);
+            results.extend(batch);
+            if failed {
+                break;
+            }
+        }
+        results
+    } else {
+        run_downloads(futures, rate_limit_bytes_per_sec, concurrent).await?
+    };
     sfence_after_download();
+    let results = results_in_piece_order(results, &schedule)?;
     combine_transfer_checksums(&results, &expected)
+}
+
+pub const BUNDLE_MANIFEST_NAME: &str = "export/MANIFEST.json";
+
+pub async fn find_bundle_checkpoint(
+    elapsed_samples: u64,
+    urls: &str,
+) -> Result<Option<(String, u64)>, CopyPortError> {
+    let (_channels, entries, _) = connect_and_list(urls, String::new()).await?;
+    select_bundle_checkpoint(&entries, elapsed_samples)
+}
+
+fn select_bundle_checkpoint(
+    entries: &[Vec<(String, usize)>],
+    elapsed_samples: u64,
+) -> Result<Option<(String, u64)>, CopyPortError> {
+    let mut newest_unbundled: Option<String> = None;
+    for prefix in full_prefixes_newest_first(entries) {
+        if !is_newer_prefix(&prefix, elapsed_samples) {
+            break;
+        }
+        let manifest_name = format!("{prefix}/{BUNDLE_MANIFEST_NAME}");
+        let on_all_channels = entries.iter().filter(|l| !l.is_empty()).all(|list| {
+            list.iter()
+                .any(|(name, size)| name == &manifest_name && *size > 0)
+        });
+        if on_all_channels {
+            if let Some(skipped) = &newest_unbundled {
+                log::warn!(
+                    "copy_port: newest checkpoint {skipped} has no complete \
+                     {BUNDLE_MANIFEST_NAME}; using older bundled checkpoint {prefix}"
+                );
+            }
+            let elapsed = parse_elapsed_from_prefix(&prefix).unwrap_or(elapsed_samples);
+            return Ok(Some((prefix, elapsed)));
+        }
+        newest_unbundled.get_or_insert(manifest_name);
+    }
+    match newest_unbundled {
+        Some(key) => Err(CopyPortError::NotFound { key }),
+        None => Ok(None),
+    }
+}
+
+pub async fn download_named_files(
+    prefix: &str,
+    urls: &str,
+    names: &[String],
+) -> Result<Vec<Vec<u8>>, CopyPortError> {
+    let prefix = format!("{}/", prefix.trim_end_matches('/'));
+    let (channels, entries, _) = connect_and_list(urls, prefix.clone()).await?;
+    let complete: Vec<usize> = (0..channels.len())
+        .filter(|&i| {
+            let listing: HashMap<&str, usize> =
+                entries[i].iter().map(|(n, s)| (n.as_str(), *s)).collect();
+            names
+                .iter()
+                .all(|n| listing.contains_key(n.strip_prefix(&prefix).unwrap_or(n)))
+        })
+        .collect();
+    let Some(&channel_idx) = complete.as_slice().choose(&mut rand::rng()) else {
+        return Err(CopyPortError::NotFound {
+            key: format!(
+                "{prefix}{{{}}} (no channel lists all files)",
+                names.join(",")
+            ),
+        });
+    };
+    let listing: HashMap<&str, usize> = entries[channel_idx]
+        .iter()
+        .map(|(name, size)| (name.as_str(), *size))
+        .collect();
+
+    let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(names.len());
+    let mut sizes: Vec<usize> = Vec::with_capacity(names.len());
+    let mut futures: Vec<TransferFuture> = Vec::with_capacity(names.len());
+    for name in names {
+        let relative = name.strip_prefix(&prefix).unwrap_or(name);
+        let Some(&size) = listing.get(relative) else {
+            return Err(CopyPortError::NotFound {
+                key: format!("{prefix}{relative}"),
+            });
+        };
+        let full_name = format!("{prefix}{relative}");
+        let mut buf = vec![0u8; size];
+        let b: &'static mut [u8] = unsafe { mem::transmute(&mut buf[..]) };
+        buffers.push(buf);
+        sizes.push(size);
+        futures.push(Box::pin(send_entries(
+            channels[channel_idx].clone(),
+            vec![full_name.into_bytes()],
+            vec![0],
+            vec![size],
+            b,
+            String::new(),
+            #[cfg(target_os = "linux")]
+            (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
+        )));
+    }
+
+    let results = run_downloads(futures, None, None).await?;
+    sfence_after_download();
+    check_transfer_results(&results, &sizes)?;
+    Ok(buffers)
 }
 
 pub async fn download_embedding_table(
@@ -564,6 +814,7 @@ pub async fn download_embedding_table(
         rate_limit_bytes_per_sec,
         max_concurrent_downloads,
         crate::emb_table::peer_conns_per_source(),
+        crate::emb_table::trainer_conns_per_source(),
     )
     .await
 }
@@ -576,12 +827,27 @@ async fn download_embedding_table_with_conns(
     rate_limit_bytes_per_sec: Option<u64>,
     max_concurrent_downloads: Option<usize>,
     peer_conns_per_source: usize,
+    trainer_conns_per_source: usize,
 ) -> Result<u32, CopyPortError> {
     let prefix = checkpoint_prefix_from_path(path)?;
     let resolved = resolve_copy_urls(urls).await?;
-    let (mut channels, entries) = connect_and_list(&resolved, prefix.clone()).await?;
+    let (mut channels, entries, endpoints) = connect_and_list(&resolved, prefix.clone()).await?;
     let layout = ShardedLayout::from_listing(name, &entries)?;
     layout.check_buffer_size(name, buf.len())?;
+    if trainer_conns_per_source > 1 && matches!(layout.ownership, ShardOwnership::Sharded { .. }) {
+        return download_sharded_with_channels(
+            &channels,
+            &entries,
+            &prefix,
+            name,
+            buf,
+            rate_limit_bytes_per_sec,
+            max_concurrent_downloads,
+            &endpoints,
+            trainer_conns_per_source,
+        )
+        .await;
+    }
     if matches!(layout.ownership, ShardOwnership::Replicated { .. }) {
         crate::emb_table::expand_replicated_channels(
             &resolved,
@@ -592,11 +858,12 @@ async fn download_embedding_table_with_conns(
         .await;
     }
 
-    let (futures, expected) =
+    let (futures, expected, schedule) =
         spawn_sharded_downloads(&layout, &prefix, name, &channels, buf).await?;
     let concurrent = max_concurrent_downloads.or(Some((channels.len() / 2).max(1)));
     let results = run_downloads(futures, rate_limit_bytes_per_sec, concurrent).await?;
     sfence_after_download();
+    let results = results_in_piece_order(results, &schedule)?;
     combine_transfer_checksums(&results, &expected)
 }
 
@@ -655,6 +922,7 @@ fn build_dense_downloads(
             vec![0],
             vec![size],
             b,
+            String::new(),
             #[cfg(target_os = "linux")]
             (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
         ));
@@ -671,6 +939,7 @@ fn build_dense_downloads(
             vec![0],
             vec![index.checksums_size],
             b,
+            String::new(),
             #[cfg(target_os = "linux")]
             (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
         ));
@@ -789,6 +1058,52 @@ pub(crate) fn classify_shard_ownership(
     )))
 }
 
+pub(crate) fn shuffle_sharded_schedule(n: usize, name: &str) -> Vec<usize> {
+    let mut schedule: Vec<usize> = (0..n).collect();
+    if n <= 1 {
+        return schedule;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(id) = std::env::var("POD_NAME").or_else(|_| std::env::var("HOSTNAME")) {
+        id.hash(&mut hasher);
+    }
+    name.hash(&mut hasher);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(hasher.finish());
+    schedule.shuffle(&mut rng);
+    schedule
+}
+
+pub(crate) fn restore_piece_order<T>(shuffled: Vec<T>, schedule: &[usize]) -> Option<Vec<T>> {
+    if shuffled.len() != schedule.len() {
+        return None;
+    }
+    let mut out: Vec<Option<T>> = (0..schedule.len()).map(|_| None).collect();
+    for (item, &orig) in shuffled.into_iter().zip(schedule) {
+        if orig >= out.len() || out[orig].is_some() {
+            return None;
+        }
+        out[orig] = Some(item);
+    }
+    out.into_iter().collect()
+}
+
+fn results_in_piece_order(
+    results: Vec<(usize, u32)>,
+    schedule: &[usize],
+) -> Result<Vec<(usize, u32)>, CopyPortError> {
+    if results
+        .iter()
+        .any(|(sent, _)| *sent == TRANSFER_FAILED_SENTINEL)
+    {
+        return Err(CopyPortError::TransferFailed(
+            "gRPC/RDMA transfer failed (check Rust logs)".into(),
+        ));
+    }
+    restore_piece_order(results, schedule).ok_or_else(|| {
+        CopyPortError::TransferFailed("shuffled download result count/order mismatch".into())
+    })
+}
+
 pub(crate) fn combine_transfer_checksums(
     results: &[(usize, u32)],
     expected: &[usize],
@@ -870,13 +1185,137 @@ impl ShardedLayout {
     }
 }
 
+async fn spawn_striped_trainer_downloads(
+    layout: &ShardedLayout,
+    prefix: &str,
+    name: &str,
+    channels: &[Channel],
+    endpoints: &[Endpoint],
+    buf: &mut [u8],
+    connections: usize,
+) -> Result<(Vec<TransferFuture>, Vec<usize>, Vec<usize>), CopyPortError> {
+    let ShardOwnership::Sharded { owner, .. } = &layout.ownership else {
+        return Err(CopyPortError::Other(
+            "trainer striping requires shard owners".into(),
+        ));
+    };
+    let piece = layout.piece_bytes;
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for j in 0..layout.total_pieces() {
+        let key = format!("{name}/c/{j}/0");
+        let Some(&source) = owner.get(&key) else {
+            return Err(CopyPortError::NotFound { key });
+        };
+        if let Some((last, _, end)) = runs.last_mut()
+            && *last == source
+        {
+            *end += piece;
+        } else {
+            runs.push((source, j * piece, (j + 1) * piece));
+        }
+    }
+    let groups = join_all(channels.iter().enumerate().map(|(source, primary)| {
+        let max_bytes = runs
+            .iter()
+            .filter(|r| r.0 == source)
+            .map(|r| r.2 - r.1)
+            .max()
+            .unwrap_or(0);
+        let owned: Vec<_> = owner
+            .iter()
+            .filter(|(_, i)| **i == source)
+            .map(|(key, _)| key)
+            .collect();
+        async move {
+            let mut group = vec![primary.clone()];
+            let Some(endpoint) = endpoints.get(source) else {
+                return group;
+            };
+            let extras = join_all((1..connections.min(max_bytes)).map(|_| {
+                let owned = &owned;
+                async move {
+                    let candidate = match endpoint.connect().await {
+                        Ok(channel) => channel,
+                        Err(e) => {
+                            log::warn!("copy_port: extra trainer connection {source} failed ({e})");
+                            return None;
+                        }
+                    };
+                    match list_entries(slice::from_ref(&candidate), prefix).await {
+                        Ok(lists)
+                            if lists.first().is_some_and(|list| {
+                                owned.iter().all(|key| {
+                                    list.iter().any(|(k, size)| k == *key && *size == piece)
+                                })
+                            }) =>
+                        {
+                            Some(candidate)
+                        }
+                        other => {
+                            log::warn!(
+                                "copy_port: dropping extra trainer connection {source}: \
+                                 missing owned files for {prefix}{name} or listing failed ({:?})",
+                                other.err()
+                            );
+                            None
+                        }
+                    }
+                }
+            }))
+            .await;
+            group.extend(extras.into_iter().flatten());
+            group
+        }
+    }))
+    .await;
+
+    let mut futures: Vec<TransferFuture> = Vec::new();
+    let mut expected = Vec::new();
+    for (source, start, end) in runs {
+        let bytes = end - start;
+        let count = groups[source].len().min(bytes);
+        let boundary = |i: usize| start + i * (bytes / count) + i.min(bytes % count);
+        for (connection, channel) in groups[source].iter().take(count).enumerate() {
+            let (lo, hi) = (boundary(connection), boundary(connection + 1));
+            let mut names = Vec::new();
+            let mut offsets = Vec::new();
+            let mut sizes = Vec::new();
+            for j in lo / piece..hi.div_ceil(piece) {
+                let offset = lo.saturating_sub(j * piece);
+                names.push(format!("{prefix}{name}/c/{j}/0").into_bytes());
+                offsets.push(offset);
+                sizes.push((hi - j * piece).min(piece) - offset);
+            }
+            expected.push(hi - lo);
+            let b: &'static mut [u8] = unsafe { mem::transmute(&mut buf[lo..hi]) };
+            futures.push(Box::pin(send_entries(
+                channel.clone(),
+                names,
+                offsets,
+                sizes,
+                b,
+                format!("source={source} connection={connection}"),
+                #[cfg(target_os = "linux")]
+                (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
+            )));
+        }
+    }
+    let schedule = shuffle_sharded_schedule(futures.len(), name);
+    let mut futures: Vec<_> = futures.into_iter().map(Some).collect();
+    let shuffled = schedule
+        .iter()
+        .map(|&i| futures[i].take().unwrap())
+        .collect();
+    Ok((shuffled, expected, schedule))
+}
+
 async fn spawn_sharded_downloads(
     layout: &ShardedLayout,
     prefix: &str,
     name: &str,
     channels: &[Channel],
     buf: &mut [u8],
-) -> Result<(Vec<TransferFuture>, Vec<usize>), CopyPortError> {
+) -> Result<(Vec<TransferFuture>, Vec<usize>, Vec<usize>), CopyPortError> {
     let name_prefix = format!("{name}/c/");
     let piece = layout.piece_bytes;
 
@@ -910,6 +1349,18 @@ async fn spawn_sharded_downloads(
             replicated_send_ranges(*total_pieces, channels.len(), peer_send_max_pieces(piece))
         }
     };
+
+    let schedule = match &layout.ownership {
+        ShardOwnership::Sharded { .. } => shuffle_sharded_schedule(ranges.len(), name),
+        ShardOwnership::Replicated { .. } => (0..ranges.len()).collect(),
+    };
+    if matches!(layout.ownership, ShardOwnership::Sharded { .. }) && ranges.len() > 1 {
+        log::info!(
+            "copy_port: shard schedule shuffled name={name} n={} first={:?}",
+            schedule.len(),
+            &schedule[..schedule.len().min(8)]
+        );
+    }
 
     #[cfg(target_os = "linux")]
     let (contexts, devicez, mrx) = {
@@ -952,11 +1403,10 @@ async fn spawn_sharded_downloads(
         (contexts, devicez, mrx)
     };
 
+    let expected: Vec<usize> = ranges.iter().map(|&(_, a, b)| (b - a) * piece).collect();
     let mut futures = Vec::with_capacity(ranges.len());
-    let mut expected = Vec::with_capacity(ranges.len());
-    for (i, &(idx, a, b)) in ranges.iter().enumerate() {
-        #[cfg(not(target_os = "linux"))]
-        let _ = i;
+    for &i in &schedule {
+        let (idx, a, b) = ranges[i];
         let n = b - a;
         let slice = &mut buf[a * piece..b * piece];
         let slice: &'static mut [u8] =
@@ -969,13 +1419,13 @@ async fn spawn_sharded_downloads(
             vec![0; n],
             vec![piece; n],
             slice,
+            format!("rank={i}"),
             #[cfg(target_os = "linux")]
             (devicez[i].clone(), contexts.clone(), mrx[i].clone()),
         ));
         futures.push(fut);
-        expected.push(n * piece);
     }
-    Ok((futures, expected))
+    Ok((futures, expected, schedule))
 }
 
 #[cfg(test)]
@@ -1011,6 +1461,95 @@ mod tests {
         set_or_check(&mut slot, 64, "piece").unwrap();
         assert!(set_or_check(&mut slot, 32, "piece").is_err());
         assert!(set_or_check(&mut slot, 0, "piece").is_err());
+    }
+
+    fn ckpt_listing(elapsed: u64, bundled: bool) -> Vec<(String, usize)> {
+        let prefix = format!("elapsed_samples_{elapsed:018}/run");
+        let mut l = vec![(format!("{prefix}/dense/w"), 8)];
+        if bundled {
+            l.push((format!("{prefix}/{BUNDLE_MANIFEST_NAME}"), 128));
+        }
+        l
+    }
+
+    fn ckpt_prefix(elapsed: u64) -> String {
+        format!("elapsed_samples_{elapsed:018}/run")
+    }
+
+    #[test]
+    fn full_prefixes_are_newest_first_and_require_every_active_channel() {
+        let mut a = ckpt_listing(10, true);
+        a.extend(ckpt_listing(20, true));
+        a.extend(ckpt_listing(30, true));
+        let mut b = ckpt_listing(10, true);
+        b.extend(ckpt_listing(20, true));
+        let entries = vec![a, b, Vec::new()];
+        assert_eq!(
+            full_prefixes_newest_first(&entries),
+            vec![ckpt_prefix(20), ckpt_prefix(10)]
+        );
+        assert_eq!(newest_full_prefix(&entries), ckpt_prefix(20));
+    }
+
+    #[test]
+    fn bundle_discovery_picks_newest_bundled_checkpoint() {
+        let mut l = ckpt_listing(10, true);
+        l.extend(ckpt_listing(20, true));
+        let entries = vec![l.clone(), l];
+        let (prefix, elapsed) = select_bundle_checkpoint(&entries, 0).unwrap().unwrap();
+        assert_eq!(prefix, ckpt_prefix(20));
+        assert_eq!(elapsed, 20);
+    }
+
+    #[test]
+    fn bundle_discovery_falls_back_past_unbundled_newest() {
+        let mut a = ckpt_listing(10, true);
+        a.extend(ckpt_listing(20, true));
+        a.extend(ckpt_listing(30, true));
+        let mut b = ckpt_listing(10, true);
+        b.extend(ckpt_listing(20, true));
+        b.extend(ckpt_listing(30, false));
+        let entries = vec![a, b];
+        let (prefix, elapsed) = select_bundle_checkpoint(&entries, 0).unwrap().unwrap();
+        assert_eq!(prefix, ckpt_prefix(20));
+        assert_eq!(elapsed, 20);
+    }
+
+    #[test]
+    fn bundle_discovery_never_returns_older_than_current() {
+        let mut l = ckpt_listing(10, true);
+        l.extend(ckpt_listing(20, true));
+        l.extend(ckpt_listing(30, false));
+        let entries = vec![l.clone(), l];
+        match select_bundle_checkpoint(&entries, 20) {
+            Err(CopyPortError::NotFound { key }) => {
+                assert_eq!(key, format!("{}/{BUNDLE_MANIFEST_NAME}", ckpt_prefix(30)));
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bundle_discovery_none_when_nothing_newer() {
+        let mut l = ckpt_listing(10, true);
+        l.extend(ckpt_listing(20, true));
+        let entries = vec![l.clone(), l];
+        assert!(select_bundle_checkpoint(&entries, 20).unwrap().is_none());
+        assert!(select_bundle_checkpoint(&entries, 25).unwrap().is_none());
+    }
+
+    #[test]
+    fn bundle_discovery_rejects_zero_size_manifest() {
+        let prefix = ckpt_prefix(10);
+        let l = vec![
+            (format!("{prefix}/dense/w"), 8),
+            (format!("{prefix}/{BUNDLE_MANIFEST_NAME}"), 0),
+        ];
+        let entries = vec![l.clone(), l];
+        assert!(matches!(
+            select_bundle_checkpoint(&entries, 0),
+            Err(CopyPortError::NotFound { .. })
+        ));
     }
 
     fn listing(pieces: &[usize], size: usize) -> Vec<(String, usize)> {
@@ -1120,6 +1659,49 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_schedule_is_stable_permutation() {
+        let a = shuffle_sharded_schedule(32, "emb_table");
+        let b = shuffle_sharded_schedule(32, "emb_table");
+        assert_eq!(a, b);
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..32).collect::<Vec<_>>());
+        let c = shuffle_sharded_schedule(32, "post_embeddings");
+        assert_ne!(a, c);
+        assert_ne!(a, (0..32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn restore_piece_order_inverts_schedule() {
+        let schedule = vec![3, 0, 2, 1];
+        let shuffled = vec!['d', 'a', 'c', 'b'];
+        assert_eq!(
+            restore_piece_order(shuffled, &schedule).unwrap(),
+            vec!['a', 'b', 'c', 'd']
+        );
+        assert!(restore_piece_order(vec![1, 2], &[0, 1, 2]).is_none());
+        assert!(restore_piece_order(vec![1, 2, 3], &[0, 0, 1]).is_none());
+    }
+
+    #[test]
+    fn combine_after_restore_matches_piece_order() {
+        let piece_order = vec![(10, 11u32), (10, 22), (10, 33)];
+        let expected = vec![10usize, 10, 10];
+        let direct = combine_transfer_checksums(&piece_order, &expected).unwrap();
+        let schedule = vec![2, 0, 1];
+        let shuffled = vec![piece_order[2], piece_order[0], piece_order[1]];
+        let restored = restore_piece_order(shuffled.clone(), &schedule).unwrap();
+        assert_eq!(
+            combine_transfer_checksums(&restored, &expected).unwrap(),
+            direct
+        );
+        assert_ne!(
+            combine_transfer_checksums(&shuffled, &expected).unwrap(),
+            direct
+        );
+    }
+
+    #[test]
     fn replicated_send_ranges_chunk_within_blocks() {
         assert_eq!(
             replicated_send_ranges(10, 1, 4),
@@ -1206,6 +1788,674 @@ mod tests {
         let partial = vec![entries[0].clone(), vec![]];
         assert!(choose_prefix(Some("elapsed_samples_1/run"), &partial).is_err());
     }
+
+    fn tracking_downloads(
+        n: usize,
+        bytes: usize,
+        hold: Duration,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        starts: std::sync::Arc<std::sync::Mutex<Vec<Option<Instant>>>>,
+    ) -> Vec<TransferFuture> {
+        (0..n)
+            .map(|i| {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                let starts = starts.clone();
+                Box::pin(async move {
+                    starts.lock().unwrap()[i] = Some(Instant::now());
+                    let cur = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(hold).await;
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    (bytes, i as u32)
+                }) as TransferFuture
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rate_limit_caps_in_flight() {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts = std::sync::Arc::new(std::sync::Mutex::new(vec![None; 6]));
+        let futures = tracking_downloads(
+            6,
+            1,
+            Duration::from_millis(80),
+            in_flight,
+            peak.clone(),
+            starts,
+        );
+        let results = join_rate_limited(futures, 1 << 40, 2).await.unwrap();
+        assert_eq!(
+            results.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rate_limit_paces_between_batches() {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts = std::sync::Arc::new(std::sync::Mutex::new(vec![None; 4]));
+        let bytes = 200 * 1024;
+        let rate = 400 * 1024;
+        let t0 = Instant::now();
+        let results = run_downloads(
+            tracking_downloads(
+                4,
+                bytes,
+                Duration::from_millis(20),
+                in_flight,
+                peak.clone(),
+                starts.clone(),
+            ),
+            Some(rate),
+            Some(2),
+        )
+        .await
+        .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 4);
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let starts = starts.lock().unwrap();
+        let s: Vec<Instant> = starts.iter().map(|t| t.expect("started")).collect();
+        let first_batch_start = s[0].min(s[1]);
+        let second_batch_start = s[2].min(s[3]);
+        let between = second_batch_start.saturating_duration_since(first_batch_start);
+        assert!(
+            between >= Duration::from_millis(700),
+            "second batch started {between:?} after the first"
+        );
+
+        let total_bytes = (4 * bytes) as f64;
+        let min_elapsed = Duration::from_secs_f64(total_bytes / rate as f64 * 0.85);
+        assert!(
+            elapsed >= min_elapsed,
+            "elapsed {elapsed:?} is below the {min_elapsed:?} floor for {total_bytes} bytes at {rate} B/s"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rate_limit_skips_remaining_on_sentinel() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let futures: Vec<TransferFuture> = (0..4)
+            .map(|i| {
+                let started = started.clone();
+                Box::pin(async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i == 1 {
+                        (TRANSFER_FAILED_SENTINEL, 0)
+                    } else {
+                        (1_000_000, i as u32)
+                    }
+                }) as TransferFuture
+            })
+            .collect();
+        let t0 = Instant::now();
+        let results = join_rate_limited(futures, 1, 2).await.unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "must not pace a failed batch"
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|r| r.0 == TRANSFER_FAILED_SENTINEL));
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unlimited_path_spawns_all() {
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts = std::sync::Arc::new(std::sync::Mutex::new(vec![None; 4]));
+        let results = run_downloads(
+            tracking_downloads(
+                4,
+                1,
+                Duration::from_millis(80),
+                in_flight,
+                peak.clone(),
+                starts,
+            ),
+            Some(0),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "rate_limit=0 must ignore max_concurrent and spawn every future"
+        );
+    }
+
+    mod scheduler {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{mpsc, oneshot};
+
+        #[tokio::test(start_paused = true)]
+        async fn refill_preserves_order_concurrency_and_global_pacing() {
+            for rate in [Some(100), Some(0), None] {
+                let start = tokio::time::Instant::now();
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let futures = (0..4)
+                    .map(|index| {
+                        let events = events.clone();
+                        Box::pin(async move {
+                            events.lock().unwrap().push((index, true, start.elapsed()));
+                            if index == 0 {
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                            }
+                            events.lock().unwrap().push((index, false, start.elapsed()));
+                            (100usize, index as u32)
+                        }) as TransferFuture
+                    })
+                    .collect();
+                let results = run_downloads(futures, rate, Some(2)).await.unwrap();
+                assert_eq!(results, vec![(100, 0), (100, 1), (100, 2), (100, 3)]);
+                let (mut active, mut peak) = (0, 0);
+                let mut starts = [Duration::ZERO; 4];
+                for &(index, started, time) in events.lock().unwrap().iter() {
+                    if started {
+                        starts[index] = time;
+                        active += 1;
+                        peak = peak.max(active);
+                    } else {
+                        active -= 1;
+                    }
+                }
+                if rate == Some(100) {
+                    assert_eq!(starts.map(|time| time.as_millis()), [0, 0, 1000, 3000]);
+                    assert_eq!(start.elapsed(), Duration::from_secs(4));
+                    assert_eq!(peak, 2);
+                } else {
+                    assert_eq!(starts, [Duration::ZERO; 4]);
+                }
+                assert_eq!(active, 0);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failure_stops_admissions_and_drains_active_work() {
+            for panic in [false, true] {
+                let (started, mut starts) = mpsc::unbounded_channel();
+                let (finished, mut finishes) = mpsc::unbounded_channel();
+                let mut finish = Vec::new();
+                let futures = (0..4)
+                    .map(|index| {
+                        let (tx, rx) = oneshot::channel();
+                        finish.push(Some(tx));
+                        let (started, finished) = (started.clone(), finished.clone());
+                        Box::pin(async move {
+                            scopeguard::defer! { finished.send(index).unwrap(); }
+                            started.send(index).unwrap();
+                            (rx.await.expect("test transfer panicked"), index as u32)
+                        }) as TransferFuture
+                    })
+                    .collect();
+                let start = tokio::time::Instant::now();
+                let mut download = Box::pin(run_downloads(futures, Some(1), Some(3)));
+                assert!(futures::poll!(&mut download).is_pending());
+                for _ in 0..3 {
+                    starts.recv().await.unwrap();
+                }
+                finish[0].take().unwrap().send(100).unwrap();
+                assert_eq!(finishes.recv().await, Some(0));
+                assert!(futures::poll!(&mut download).is_pending());
+                if panic {
+                    drop(finish[1].take());
+                } else {
+                    finish[1]
+                        .take()
+                        .unwrap()
+                        .send(TRANSFER_FAILED_SENTINEL)
+                        .unwrap();
+                }
+                assert_eq!(finishes.recv().await, Some(1));
+                assert!(futures::poll!(&mut download).is_pending());
+                assert!(starts.try_recv().is_err());
+                finish[2].take().unwrap().send(100).unwrap();
+                let result = download.await;
+                if panic {
+                    assert!(matches!(result, Err(CopyPortError::Other(_))));
+                } else {
+                    assert_eq!(
+                        result.unwrap(),
+                        vec![(100, 0), (TRANSFER_FAILED_SENTINEL, 1), (100, 2)]
+                    );
+                }
+                assert_eq!(finishes.recv().await, Some(2));
+                assert!(starts.try_recv().is_err());
+                assert_eq!(start.elapsed(), Duration::ZERO);
+            }
+        }
+
+        #[test]
+        fn cancellation_and_shutdown_join_writers_despite_panicking_destructors() {
+            struct PanicOnDrop(Arc<AtomicUsize>);
+            impl Drop for PanicOnDrop {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("test transfer destructor panicked");
+                }
+            }
+            let (done, completed) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                for multi_thread in [false, true] {
+                    for mode in ["drop", "local", "shutdown"] {
+                        let mut builder = if multi_thread {
+                            tokio::runtime::Builder::new_multi_thread()
+                        } else {
+                            tokio::runtime::Builder::new_current_thread()
+                        };
+                        let runtime = builder.worker_threads(1).enable_all().build().unwrap();
+                        let dropped = Arc::new(AtomicUsize::new(0));
+                        let copied = Arc::new(AtomicUsize::new(0));
+                        let (started, mut ready) = mpsc::unbounded_channel();
+                        let futures = (0..3)
+                            .map(|index| {
+                                let started = started.clone();
+                                if index == 1 {
+                                    let copied = copied.clone();
+                                    Box::pin(async move {
+                                        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+                                        let worker = tokio::task::spawn_blocking(move || {
+                                            started.send(()).unwrap();
+                                            let _ = stopped.recv();
+                                            copied.fetch_add(1, Ordering::SeqCst);
+                                        });
+                                        let mut worker = (
+                                            stop,
+                                            Box::pin(
+                                                crate::emb_table::JoinOnDrop::new(worker).join(),
+                                            ),
+                                        );
+                                        worker.1.as_mut().await.unwrap();
+                                        (0usize, 0u32)
+                                    }) as TransferFuture
+                                } else {
+                                    let guard = PanicOnDrop(dropped.clone());
+                                    Box::pin(async move {
+                                        let _guard = guard;
+                                        started.send(()).unwrap();
+                                        std::future::pending().await
+                                    }) as TransferFuture
+                                }
+                            })
+                            .collect();
+                        let download = run_downloads(futures, Some(1), Some(3));
+                        if mode == "shutdown" {
+                            runtime.spawn(download);
+                            runtime.block_on(async {
+                                for _ in 0..3 {
+                                    ready.recv().await.unwrap();
+                                }
+                            });
+                            drop(runtime);
+                        } else {
+                            let cancel = async {
+                                let mut download = Box::pin(download);
+                                assert!(futures::poll!(&mut download).is_pending());
+                                for _ in 0..3 {
+                                    ready.recv().await.unwrap();
+                                }
+                                drop(download);
+                            };
+                            if mode == "local" {
+                                runtime.block_on(tokio::task::LocalSet::new().run_until(cancel));
+                            } else {
+                                runtime.block_on(cancel);
+                            }
+                        }
+                        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+                        assert_eq!(copied.load(Ordering::SeqCst), 1);
+                    }
+                }
+                done.send(()).unwrap();
+            });
+            completed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("cleanup hung");
+            thread.join().unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, any(not(target_os = "linux"), feature = "rdma-tests")))]
+mod trainer_e2e_tests {
+    use super::*;
+    use crate::grpc_util::{add_ok_trailer, freeze, get_bytes_mut, make_response};
+    use crate::proto_parser::{
+        self, BodyKind, BytesMutProtoExt, decode_names, encode_names, parse, proto,
+    };
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tonic::codegen::{Service, http};
+    use tonic::{Status, body};
+
+    const PREFIX: &str = "elapsed_samples_000000000000000042/trainer/";
+    type Files = BTreeMap<String, Vec<u8>>;
+
+    #[derive(Default)]
+    struct Traffic {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        barrier: Option<tokio::sync::Barrier>,
+        fault: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct Trainer {
+        files: Arc<Files>,
+        traffic: Arc<Traffic>,
+        sockets: Arc<Mutex<HashSet<SocketAddr>>>,
+        primary: Arc<Mutex<Option<SocketAddr>>>,
+    }
+
+    impl tonic::server::NamedService for Trainer {
+        const NAME: &'static str = "copy.Copy";
+    }
+
+    impl Service<http::Request<body::Body>> for Trainer {
+        type Response = http::Response<body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            Ok(()).into()
+        }
+
+        fn call(&mut self, request: http::Request<body::Body>) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move { Ok(make_response(this.handle(request).await)) })
+        }
+    }
+
+    impl Trainer {
+        async fn handle(self, request: http::Request<body::Body>) -> Result<body::Body, Status> {
+            use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+            let remote = request
+                .extensions()
+                .get::<TcpConnectInfo>()
+                .and_then(TcpConnectInfo::remote_addr)
+                .or_else(|| {
+                    request
+                        .extensions()
+                        .get::<TlsConnectInfo<TcpConnectInfo>>()
+                        .and_then(|i| i.get_ref().remote_addr())
+                })
+                .unwrap();
+            let fault = self.traffic.fault.load(Ordering::SeqCst);
+            let mut out = get_bytes_mut();
+            match request.uri().path() {
+                "/copy.Copy/List" => {
+                    parse(crate::proto![], request.into_body(), BodyKind::Request).await?;
+                    let primary = *self.primary.lock().unwrap().get_or_insert(remote);
+                    if fault == 1 && remote != primary {
+                        return Err(Status::unavailable("extra connection cannot list"));
+                    }
+                    let (names, prefixes, suffixes) =
+                        encode_names(self.files.keys().map(|k| k.as_bytes().to_vec()).collect());
+                    out.put_string(1, &names);
+                    out.put_repeated_ints(
+                        [2, 3, 4],
+                        [
+                            &prefixes,
+                            &suffixes,
+                            &self.files.values().map(Vec::len).collect::<Vec<_>>(),
+                        ],
+                    );
+                }
+                "/copy.Copy/Send" => {
+                    let (mut names, mut prefixes, mut suffixes, mut offsets, mut sizes) = (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::<usize>::new(),
+                        Vec::<usize>::new(),
+                    );
+                    parse(
+                        crate::proto![
+                            (1, proto_parser::bytes(&mut names)),
+                            (2, proto_parser::repeated_ints(&mut prefixes)),
+                            (3, proto_parser::repeated_ints(&mut suffixes)),
+                            (4, proto_parser::repeated_ints(&mut offsets)),
+                            (5, proto_parser::repeated_ints(&mut sizes)),
+                        ],
+                        request.into_body(),
+                        BodyKind::Request,
+                    )
+                    .await?;
+                    let names = decode_names(names, prefixes, suffixes)?;
+                    let first_stripe = offsets.first() == Some(&0);
+                    let first_name = std::str::from_utf8(&names[0]).unwrap();
+                    let sharded = first_name.contains("/emb_table/")
+                        || first_name.contains("/post_embeddings.embeddings/");
+                    let mut data = Vec::new();
+                    for ((name, offset), size) in names.into_iter().zip(offsets).zip(sizes) {
+                        let name = String::from_utf8(name).unwrap();
+                        let file = self
+                            .files
+                            .get(&name)
+                            .ok_or_else(|| Status::not_found(&name))?;
+                        data.extend_from_slice(
+                            file.get(offset..offset + size)
+                                .ok_or_else(|| Status::out_of_range(&name))?,
+                        );
+                    }
+                    self.sockets.lock().unwrap().insert(remote);
+                    let active = self.traffic.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.traffic.peak.fetch_max(active, Ordering::SeqCst);
+                    if sharded && let Some(barrier) = &self.traffic.barrier {
+                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                            .await
+                            .unwrap();
+                    }
+                    self.traffic.active.fetch_sub(1, Ordering::SeqCst);
+                    if fault == 2 && first_stripe {
+                        data.pop();
+                    }
+                    out.put_string(1, &data);
+                }
+                _ => return Err(Status::unimplemented("unexpected copy_port method")),
+            }
+            Ok(add_ok_trailer(freeze(out)))
+        }
+    }
+
+    async fn serve(
+        files: Files,
+        traffic: Arc<Traffic>,
+        tls: Option<tonic::transport::ServerTlsConfig>,
+    ) -> (String, Arc<Mutex<HashSet<SocketAddr>>>, impl Drop) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let sockets = Arc::new(Mutex::new(HashSet::new()));
+        let service = Trainer {
+            files: Arc::new(files),
+            traffic,
+            sockets: sockets.clone(),
+            primary: Arc::default(),
+        };
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(tls) = tls {
+            builder = builder.tls_config(tls).unwrap();
+        }
+        let task = tokio::spawn(async move {
+            builder
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (url, sockets, scopeguard::guard(task, |task| task.abort()))
+    }
+
+    fn tensor(name: &str, pieces: std::ops::Range<usize>, piece: usize) -> Files {
+        pieces
+            .map(|j| {
+                (
+                    format!("{PREFIX}{name}/c/{j}/0"),
+                    (j * piece..(j + 1) * piece).map(|i| i as u8).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(copy_tls_env)]
+    async fn trainer_hotswap_preserves_sources_checksums_and_shared_budget() {
+        use crate::tls::{ENV_TLS_CA, ENV_TLS_SERVER_NAME};
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        xai_init_utils::init().rustls();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["copy.test".into()])
+            .unwrap()
+            .signed_by(&key, &ca, &ca_key)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        let keys = [
+            ENV_TLS_CA,
+            ENV_TLS_SERVER_NAME,
+            "COPY_PORT_TRAINER_CONNS_PER_SOURCE",
+            "COPY_PORT_PEER_CONNS_PER_SOURCE",
+        ];
+        let saved = keys.map(|key| (key, std::env::var_os(key)));
+        let _restore = scopeguard::guard(saved, |saved| {
+            for (key, value) in saved {
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        });
+        unsafe {
+            std::env::set_var(ENV_TLS_CA, &ca_path);
+            std::env::set_var(ENV_TLS_SERVER_NAME, "copy.test");
+            std::env::set_var("COPY_PORT_PEER_CONNS_PER_SOURCE", "16");
+        }
+        for (connections, rate) in [(1, None), (2, None), (4, Some(64))] {
+            unsafe {
+                if connections == 1 {
+                    std::env::remove_var(keys[2]);
+                } else {
+                    std::env::set_var(keys[2], connections.to_string());
+                }
+            }
+            let traffic = Arc::new(Traffic {
+                barrier: Some(tokio::sync::Barrier::new(2)),
+                ..Traffic::default()
+            });
+            let files = |pieces: std::ops::Range<usize>| {
+                [
+                    tensor("emb_table", pieces.clone(), 7),
+                    tensor("post_embeddings.embeddings", pieces, 5),
+                    tensor("dense", 0..1, 3),
+                    [(
+                        format!("{PREFIX}checksums.0.json"),
+                        b"{\"created_timestamp\":42}".to_vec(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            };
+            let tls = tonic::transport::ServerTlsConfig::new().identity(
+                tonic::transport::Identity::from_pem(cert.pem(), key.serialize_pem()),
+            );
+            let (a, a_sockets, _a) = serve(files(2..4), traffic.clone(), Some(tls)).await;
+            let (driver, _, _driver) = serve(Files::new(), traffic.clone(), None).await;
+            let (b, b_sockets, _b) = serve(files(0..2), traffic.clone(), None).await;
+            let (mut dense, mut emb, mut pe) = (vec![255; 3], vec![255; 28], vec![255; 20]);
+            let start = Instant::now();
+            let (meta, emb_sum, pe_sum) = download_dense_and_embeddings(
+                0,
+                &format!("{a},{driver},{b}"),
+                &mut [TensorBuf {
+                    key: "dense".into(),
+                    buf: &mut dense,
+                }],
+                &mut emb,
+                Some(&mut pe),
+                rate,
+                Some(connections.max(2)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta.prefix, PREFIX.trim_end_matches('/'));
+            assert_eq!(meta.created_timestamp, 42.0);
+            assert_eq!(dense, vec![0, 1, 2]);
+            assert_eq!(emb, (0..28).collect::<Vec<u8>>());
+            assert_eq!(pe, (0..20).collect::<Vec<u8>>());
+            assert_eq!(emb_sum, simd_adler32::adler32(&emb.as_slice()));
+            assert_eq!(pe_sum, Some(simd_adler32::adler32(&pe.as_slice())));
+            for sockets in [a_sockets, b_sockets] {
+                assert_eq!(sockets.lock().unwrap().len(), 2 * connections - 1);
+            }
+            assert!(traffic.peak.load(Ordering::SeqCst) <= connections.max(2));
+            assert_eq!(traffic.active.load(Ordering::SeqCst), 0);
+            if rate.is_some() {
+                assert!(start.elapsed() >= Duration::from_millis(750));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(copy_tls_env)]
+    async fn trainer_extra_listing_fallback_and_short_transfer_retry() {
+        let traffic = Arc::new(Traffic::default());
+        let (url, sockets, _server) =
+            serve(tensor("emb_table", 0..2, 7), traffic.clone(), None).await;
+        let mut buf = vec![255; 14];
+        for fault in [1, 2, 0] {
+            traffic.fault.store(fault, Ordering::SeqCst);
+            sockets.lock().unwrap().clear();
+            buf.fill(255);
+            let result = download_embedding_table_with_conns(
+                PREFIX,
+                &url,
+                "emb_table",
+                &mut buf,
+                None,
+                Some(2),
+                16,
+                2,
+            )
+            .await;
+            assert_eq!(traffic.active.load(Ordering::SeqCst), 0);
+            if fault == 2 {
+                assert!(matches!(result, Err(CopyPortError::TransferFailed(_))));
+            } else {
+                assert_eq!(result.unwrap(), simd_adler32::adler32(&buf.as_slice()));
+                assert_eq!(buf, (0..14).collect::<Vec<u8>>());
+            }
+            assert_eq!(
+                sockets.lock().unwrap().len(),
+                if fault == 1 { 1 } else { 2 }
+            );
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux", feature = "rdma-tests"))]
@@ -1289,6 +2539,7 @@ mod p2p_e2e_tests {
             None,
             None,
             2,
+            1,
         )
         .await
         .unwrap();
@@ -1341,6 +2592,7 @@ mod p2p_e2e_tests {
             None,
             None,
             2,
+            1,
         )
         .await
         .unwrap();

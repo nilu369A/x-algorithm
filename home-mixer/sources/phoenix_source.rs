@@ -1,24 +1,30 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixRetrievalFallback, EnablePhoenixSource, PhoenixMaxResults,
-    PhoenixRetrievalInferenceClusterId, PhoenixRetrievalNewUserHistoryThreshold,
-    PhoenixRetrievalNewUserInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
+    EnablePhoenixRetrievalFallback, EnablePhoenixSource, PhoenixColdStartMaxResults,
+    PhoenixMaxResults, PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
+    PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,
+    PhoenixXdsRetrievalMaxRetries,
 };
 use crate::util::egress::RetrievalDispatch;
-use crate::util::phoenix_request::{build_client_context, build_user_context};
+use crate::util::phoenix_request::{
+    build_client_context, build_user_context, candidates_from_retrieval_response,
+};
 use tonic::async_trait;
-use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::{
+    PhoenixRetrievalCluster, RetrievalExclusions,
+};
 use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
+use xai_recsys_proto::RetrievalDatasetType;
 
 pub struct PhoenixSource {
     pub dispatch: RetrievalDispatch,
 }
 
 impl PhoenixSource {
-    fn resolve_cluster(query: &ScoredPostsQuery) -> PhoenixRetrievalCluster {
+    pub(crate) fn resolve_cluster(query: &ScoredPostsQuery) -> PhoenixRetrievalCluster {
         let configured_cluster =
             PhoenixRetrievalCluster::parse(&query.params.get(PhoenixRetrievalInferenceClusterId));
 
@@ -55,6 +61,36 @@ impl PhoenixSource {
 
         configured_cluster
     }
+
+    pub(crate) fn seen_post_exclusions(query: &ScoredPostsQuery) -> RetrievalExclusions {
+        if !query.params.get(PhoenixRetrievalExcludeSeenPosts) {
+            return RetrievalExclusions::default();
+        }
+        let mut post_ids: Vec<u64> = query
+            .seen_ids
+            .iter()
+            .chain(query.served_ids.iter())
+            .copied()
+            .collect();
+        if query.bloom_filter_entries.is_empty() {
+            post_ids.extend(query.impressed_post_ids.iter().copied());
+        }
+        post_ids.sort_unstable();
+        post_ids.dedup();
+        let bloom_filters = query
+            .bloom_filter_entries
+            .iter()
+            .map(|e| xai_recsys_proto::ExcludedPostsBloomFilter {
+                bit_array: e.bloom_filter.clone(),
+                size_cap: e.size_cap,
+                false_positive_rate: e.false_positive_rate,
+            })
+            .collect();
+        RetrievalExclusions {
+            post_ids,
+            bloom_filters,
+        }
+    }
 }
 
 #[async_trait]
@@ -80,41 +116,39 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
 
         let response = self
             .dispatch
-            .retrieve_with_fallback(
+            .retrieve_with_fallback_excluding(
                 query,
                 cluster,
                 user_id,
                 sequence.clone(),
                 query.columnar_retrieval_sequence.clone(),
                 quality_factor::apply(query.params.get(PhoenixMaxResults)),
+                query.params.get(PhoenixColdStartMaxResults),
                 vec![],
                 None,
                 client_context,
                 user_context,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
                 query.params.get(EnablePhoenixRetrievalFallback),
+                vec![],
+                Self::seen_post_exclusions(query),
             )
             .await
             .map_err(|e| format!("PhoenixSource: {e}"))?;
 
-        let candidates: Vec<PostCandidate> = response
-            .top_k_candidates
-            .into_iter()
-            .flat_map(|scored_candidates| scored_candidates.candidates)
-            .filter_map(|scored_candidate| scored_candidate.candidate)
-            .map(|tweet_info| PostCandidate {
-                tweet_id: tweet_info.tweet_id,
-                author_id: tweet_info.author_id,
-                in_reply_to_tweet_id: (tweet_info.in_reply_to_tweet_id != 0)
-                    .then_some(tweet_info.in_reply_to_tweet_id),
-                retweeted_tweet_id: (tweet_info.retweeted_tweet_id != 0)
-                    .then_some(tweet_info.retweeted_tweet_id),
-                served_type: Some(pb::ServedType::ForYouPhoenixRetrieval),
-                ..Default::default()
-            })
-            .collect();
+        Ok(candidates_from_retrieval_response(
+            response,
+            served_type_for_dataset,
+            cluster,
+        ))
+    }
+}
 
-        Ok(candidates)
+fn served_type_for_dataset(dataset_type: u32) -> pb::ServedType {
+    if dataset_type == RetrievalDatasetType::HomeCold as u32 {
+        pb::ServedType::ForYouPhoenixRetrievalCold
+    } else {
+        pb::ServedType::ForYouPhoenixRetrieval
     }
 }
 
@@ -149,5 +183,46 @@ mod tests {
             ..Default::default()
         };
         assert!(!source().enable(&query));
+    }
+
+    #[test]
+    fn candidates_from_response_sets_served_type() {
+        use xai_recsys_proto::{
+            RetrieveTopKCandidatesResponse, ScoredCandidate, ScoredCandidates, TweetInfo,
+        };
+
+        let tweet = |id, author, dataset_type| ScoredCandidate {
+            candidate: Some(TweetInfo {
+                tweet_id: id,
+                author_id: author,
+                ..Default::default()
+            }),
+            dataset_type,
+            ..Default::default()
+        };
+        let response = RetrieveTopKCandidatesResponse {
+            top_k_candidates: vec![ScoredCandidates {
+                user_id: 1,
+                candidates: vec![
+                    tweet(10, 1, RetrievalDatasetType::Home as u32),
+                    tweet(11, 2, RetrievalDatasetType::HomeCold as u32),
+                ],
+            }],
+        };
+        let got: Vec<(u64, pb::ServedType)> = candidates_from_retrieval_response(
+            response,
+            served_type_for_dataset,
+            PhoenixRetrievalCluster::Experiment1Fou,
+        )
+        .into_iter()
+        .map(|c| (c.tweet_id, c.served_type.unwrap()))
+        .collect();
+        assert_eq!(
+            got,
+            vec![
+                (10, pb::ServedType::ForYouPhoenixRetrieval),
+                (11, pb::ServedType::ForYouPhoenixRetrievalCold),
+            ]
+        );
     }
 }

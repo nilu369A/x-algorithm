@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use super::writer::{atomic_write_parquet, find_latest_versioned_file, read_parqu
 use super::{SnapshotStore, StoreConfig, StoreError, WindowRouter};
 use crate::config::WindowConfig;
 use crate::metrics::PipelineMetrics;
-use crate::processor::record::{IndexRecord, PostId};
+use crate::processor::record::{EngagementCounts, IndexRecord, PostId};
 
 #[derive(Debug, Clone)]
 enum StoredValue {
@@ -48,6 +48,15 @@ impl StoredValue {
         }
     }
 
+    fn merge(existing: Self, incoming: Self) -> Self {
+        match (existing, incoming) {
+            (StoredValue::Full(old), StoredValue::Full(new)) => StoredValue::Full(Arc::new(
+                old.as_ref().clone().merge_with(new.as_ref().clone()),
+            )),
+            (_, incoming) => incoming,
+        }
+    }
+
     fn author_id(&self) -> i64 {
         match self {
             StoredValue::Core(author_id) => *author_id,
@@ -73,6 +82,14 @@ impl StoredValue {
 
 type WindowData = HashMap<PostId, StoredValue>;
 
+fn upsert_stored(map: &mut WindowData, post_id: PostId, incoming: StoredValue) {
+    let merged = match map.remove(&post_id) {
+        Some(existing) => StoredValue::merge(existing, incoming),
+        None => incoming,
+    };
+    map.insert(post_id, merged);
+}
+
 type BufferMap = HashMap<String, WindowData>;
 
 struct SharedState {
@@ -89,6 +106,8 @@ pub struct BaseSnapshotStore {
     dump_handle: Mutex<Option<JoinHandle<()>>>,
     dump_completed: Arc<AtomicBool>,
 }
+
+const PREFLOOR_SLACK_SECS: f64 = 6.0 * 3600.0;
 
 impl BaseSnapshotStore {
         pub fn new(config: StoreConfig, router: WindowRouter, metrics: Arc<PipelineMetrics>) -> Self {
@@ -119,42 +138,99 @@ impl BaseSnapshotStore {
                 .output_dir
                 .join(format!("{window_name}.parquet"));
 
-            let actual_path = if symlink_path.exists() {
+            let public_path = if symlink_path.exists() {
                 Some(symlink_path.clone())
             } else {
                 find_latest_versioned_file(&self.config.output_dir, &window_name)
             };
 
-            let Some(actual_path) = actual_path else {
-                info!("no existing data for window '{window_name}', creating empty parquet");
-                state.main_data.insert(window_name.clone(), HashMap::new());
-                if let Err(e) = write_empty_parquet(
-                    &self.config.output_dir,
-                    &window_name,
-                    self.config.versions_to_keep,
-                    &self.config.pipeline,
-                ) {
-                    warn!("failed to create empty parquet for {window_name}: {e}");
-                }
-                continue;
-            };
-
-            match read_parquet_file(&actual_path) {
-                Ok(batches) => {
-                    let mut window_data = HashMap::new();
-                    for batch in &batches {
-                        load_post_ids_from_batch(batch, &mut window_data, &self.config.pipeline);
+            let mut window_data = HashMap::new();
+            if let Some(path) = &public_path {
+                match read_parquet_file(path) {
+                    Ok(batches) => {
+                        for batch in &batches {
+                            load_post_ids_from_batch(
+                                batch,
+                                &mut window_data,
+                                &self.config.pipeline,
+                            );
+                        }
                     }
-                    let count = window_data.len();
-                    total_loaded += count;
-                    info!("loaded {count} records into window '{window_name}'");
-                    state.main_data.insert(window_name, window_data);
-                }
-                Err(e) => {
-                    warn!("failed to load {}: {e}", actual_path.display());
-                    state.main_data.insert(window_name, HashMap::new());
+                    Err(e) => warn!("failed to load {}: {e}", path.display()),
                 }
             }
+            if wc.min_age.is_some() {
+                let pf_name = format!("prefloor_{window_name}");
+                let pf_link = self.config.output_dir.join(format!("{pf_name}.parquet"));
+                let pf_path = if pf_link.exists() {
+                    Some(pf_link)
+                } else {
+                    find_latest_versioned_file(&self.config.output_dir, &pf_name)
+                };
+                if let Some(pf_path) = pf_path {
+                    match read_parquet_file(&pf_path) {
+                        Ok(pf_batches) => {
+                            for batch in &pf_batches {
+                                load_post_ids_from_batch(
+                                    batch,
+                                    &mut window_data,
+                                    &self.config.pipeline,
+                                );
+                            }
+                        }
+                        Err(e) => warn!("failed to load {}: {e}", pf_path.display()),
+                    }
+                }
+            }
+
+            if public_path.is_none() {
+                let now = chrono::Utc::now().timestamp() as f64;
+                let retention_cutoff =
+                    timestamp_secs_to_snowflake(now - wc.retention.as_secs() as f64);
+                let min_age_cutoff = wc
+                    .min_age
+                    .map(|d| timestamp_secs_to_snowflake(now - d.as_secs() as f64));
+                let mut entries: Vec<(i64, &StoredValue)> = window_data
+                    .iter()
+                    .map(|(&pid, val)| (pid, val))
+                    .filter(|&(pid, _)| {
+                        pid >= retention_cutoff && min_age_cutoff.is_none_or(|c| pid < c)
+                    })
+                    .collect();
+                entries.sort_by_key(|(pid, _)| *pid);
+                info!(
+                    "public file missing for window '{window_name}', regenerating with {} records",
+                    entries.len()
+                );
+                let regen = if entries.is_empty() {
+                    Ok(empty_batch_for_window(&window_name, &self.config.pipeline))
+                } else {
+                    stored_to_batch(
+                        &entries,
+                        &window_name,
+                        &self.config.pipeline,
+                        self.config.sid_num_levels,
+                    )
+                };
+                match regen {
+                    Ok(batch) => {
+                        if let Err(e) = atomic_write_parquet(
+                            &self.config.output_dir,
+                            &window_name,
+                            now as i64,
+                            &batch,
+                            self.config.versions_to_keep,
+                        ) {
+                            warn!("failed to regenerate public parquet for {window_name}: {e}");
+                        }
+                    }
+                    Err(e) => warn!("failed to build regen batch for {window_name}: {e}"),
+                }
+            }
+            let count = window_data.len();
+            total_loaded += count;
+            info!("loaded {count} records into window '{window_name}'");
+            state.main_data.insert(window_name.clone(), window_data);
         }
 
         if total_loaded > 0 {
@@ -259,6 +335,12 @@ impl BaseSnapshotStore {
         for wc in &self.config.windows {
             let window_name = wc.window_name();
             let retention_secs = wc.retention.as_secs() as f64;
+            let min_age_cutoff = wc
+                .min_age
+                .map(|d| timestamp_secs_to_snowflake(now - d.as_secs() as f64));
+            let prefloor_cutoff = wc.min_age.map(|d| {
+                timestamp_secs_to_snowflake(now - d.as_secs() as f64 - PREFLOOR_SLACK_SECS)
+            });
 
             if let Some(pending) = pending_snapshot.get(&window_name)
                 && !pending.is_empty()
@@ -266,7 +348,7 @@ impl BaseSnapshotStore {
                 let mut state = self.state.lock().await;
                 let main = state.main_data.entry(window_name.clone()).or_default();
                 for (post_id, record) in pending {
-                    main.insert(*post_id, record.clone());
+                    upsert_stored(main, *post_id, record.clone());
                 }
             }
 
@@ -286,19 +368,48 @@ impl BaseSnapshotStore {
 
             let pipeline = &self.config.pipeline;
             let sid_num_levels = self.config.sid_num_levels;
-            let batch = if main.is_empty() {
+            let in_memory = main.len();
+            let mut entries: Vec<(i64, &StoredValue)> = main
+                .iter()
+                .map(|(&pid, val)| (pid, val))
+                .filter(|&(pid, _)| min_age_cutoff.is_none_or(|c| pid < c))
+                .collect();
+            entries.sort_by_key(|(pid, _)| *pid);
+            let batch = if entries.is_empty() {
                 empty_batch_for_window(&window_name, pipeline)
             } else {
-                let mut entries: Vec<(i64, &StoredValue)> =
-                    main.iter().map(|(&pid, val)| (pid, val)).collect();
-                entries.sort_by_key(|(pid, _)| *pid);
                 stored_to_batch(&entries, &window_name, pipeline, sid_num_levels)?
+            };
+            let prefloor_batch = match prefloor_cutoff {
+                Some(c) => {
+                    let mut young: Vec<(i64, &StoredValue)> = main
+                        .iter()
+                        .map(|(&pid, val)| (pid, val))
+                        .filter(|&(pid, _)| pid >= c)
+                        .collect();
+                    young.sort_by_key(|(pid, _)| *pid);
+                    Some(if young.is_empty() {
+                        empty_batch_for_window(&window_name, pipeline)
+                    } else {
+                        stored_to_batch(&young, &window_name, pipeline, sid_num_levels)?
+                    })
+                }
+                None => None,
             };
 
             let output_dir = self.config.output_dir.clone();
             let wn = window_name.clone();
             let keep = self.config.versions_to_keep;
             let written = tokio::task::spawn_blocking(move || {
+                if let Some(pb) = prefloor_batch {
+                    atomic_write_parquet(
+                        &output_dir,
+                        &format!("prefloor_{wn}"),
+                        epoch_secs,
+                        &pb,
+                        keep,
+                    )?;
+                }
                 atomic_write_parquet(&output_dir, &wn, epoch_secs, &batch, keep)
             })
             .await??;
@@ -320,7 +431,7 @@ impl BaseSnapshotStore {
             self.metrics
                 .store_buffer_size
                 .with_label_values(&[index_name, window_type])
-                .set(written as f64);
+                .set(in_memory as f64);
         }
 
         self.metrics.store_dump_completed.inc();
@@ -340,11 +451,11 @@ impl SnapshotStore for BaseSnapshotStore {
             let window_names = (self.router)(&record, &self.config.windows);
             let (post_id, stored) = StoredValue::from_record(record);
             for wn in window_names {
-                state
-                    .pending
-                    .entry(wn)
-                    .or_default()
-                    .insert(post_id, stored.clone());
+                upsert_stored(
+                    state.pending.entry(wn).or_default(),
+                    post_id,
+                    stored.clone(),
+                );
             }
         }
         Ok(())
@@ -385,9 +496,16 @@ impl SnapshotStore for BaseSnapshotStore {
                     snapshot
                 };
 
+                let mut all_ok = true;
                 for wc in &config.windows {
                     let window_name = wc.window_name();
                     let retention_secs = wc.retention.as_secs() as f64;
+                    let min_age_cutoff = wc
+                        .min_age
+                        .map(|d| timestamp_secs_to_snowflake(now - d.as_secs() as f64));
+                    let prefloor_cutoff = wc.min_age.map(|d| {
+                        timestamp_secs_to_snowflake(now - d.as_secs() as f64 - PREFLOOR_SLACK_SECS)
+                    });
 
                     if let Some(pending) = pending_snapshot.get(&window_name)
                         && !pending.is_empty()
@@ -395,7 +513,7 @@ impl SnapshotStore for BaseSnapshotStore {
                         let mut st = store_state.lock().await;
                         let main = st.main_data.entry(window_name.clone()).or_default();
                         for (post_id, record) in pending {
-                            main.insert(*post_id, record.clone());
+                            upsert_stored(main, *post_id, record.clone());
                         }
                     }
 
@@ -413,12 +531,16 @@ impl SnapshotStore for BaseSnapshotStore {
                         main.shrink_to_fit();
                     }
 
-                    let batch_result = if main.is_empty() {
+                    let in_memory = main.len();
+                    let mut entries: Vec<(i64, &StoredValue)> = main
+                        .iter()
+                        .map(|(&pid, val)| (pid, val))
+                        .filter(|&(pid, _)| min_age_cutoff.is_none_or(|c| pid < c))
+                        .collect();
+                    entries.sort_by_key(|(pid, _)| *pid);
+                    let batch_result = if entries.is_empty() {
                         Ok(empty_batch_for_window(&window_name, &config.pipeline))
                     } else {
-                        let mut entries: Vec<(i64, &StoredValue)> =
-                            main.iter().map(|(&pid, val)| (pid, val)).collect();
-                        entries.sort_by_key(|(pid, _)| *pid);
                         stored_to_batch(
                             &entries,
                             &window_name,
@@ -426,12 +548,53 @@ impl SnapshotStore for BaseSnapshotStore {
                             config.sid_num_levels,
                         )
                     };
+                    let prefloor_result = match prefloor_cutoff {
+                        Some(c) => {
+                            let mut young: Vec<(i64, &StoredValue)> = main
+                                .iter()
+                                .map(|(&pid, val)| (pid, val))
+                                .filter(|&(pid, _)| pid >= c)
+                                .collect();
+                            young.sort_by_key(|(pid, _)| *pid);
+                            if young.is_empty() {
+                                Some(Ok(empty_batch_for_window(&window_name, &config.pipeline)))
+                            } else {
+                                Some(stored_to_batch(
+                                    &young,
+                                    &window_name,
+                                    &config.pipeline,
+                                    config.sid_num_levels,
+                                ))
+                            }
+                        }
+                        None => None,
+                    };
                     match batch_result {
                         Ok(batch) => {
                             let dir = config.output_dir.clone();
                             let wn = window_name.clone();
                             let keep = config.versions_to_keep;
+                            let prefloor_batch = match prefloor_result {
+                                Some(Ok(pb)) => Some(pb),
+                                Some(Err(e)) => {
+                                    warn!(
+                                        "prefloor batch conversion failed for {window_name}: {e}"
+                                    );
+                                    all_ok = false;
+                                    continue;
+                                }
+                                None => None,
+                            };
                             match tokio::task::spawn_blocking(move || {
+                                if let Some(pb) = prefloor_batch {
+                                    atomic_write_parquet(
+                                        &dir,
+                                        &format!("prefloor_{wn}"),
+                                        epoch_secs,
+                                        &pb,
+                                        keep,
+                                    )?;
+                                }
                                 atomic_write_parquet(&dir, &wn, epoch_secs, &batch, keep)
                             })
                             .await
@@ -454,20 +617,33 @@ impl SnapshotStore for BaseSnapshotStore {
                                     metrics
                                         .store_buffer_size
                                         .with_label_values(&[idx, wt])
-                                        .set(written as f64);
+                                        .set(in_memory as f64);
                                 }
-                                Ok(Err(e)) => warn!("dump failed for {window_name}: {e}"),
-                                Err(e) => warn!("dump task panicked for {window_name}: {e}"),
+                                Ok(Err(e)) => {
+                                    warn!("dump failed for {window_name}: {e}");
+                                    all_ok = false;
+                                }
+                                Err(e) => {
+                                    warn!("dump task panicked for {window_name}: {e}");
+                                    all_ok = false;
+                                }
                             }
                         }
-                        Err(e) => warn!("batch conversion failed for {window_name}: {e}"),
+                        Err(e) => {
+                            warn!("batch conversion failed for {window_name}: {e}");
+                            all_ok = false;
+                        }
                     }
                 }
 
-                metrics.store_dump_completed.inc();
-                metrics.store_dump_last_success_ts.set(epoch_secs);
-                store_dump_completed.store(true, std::sync::atomic::Ordering::Release);
-                info!("periodic dump complete");
+                if all_ok {
+                    metrics.store_dump_completed.inc();
+                    metrics.store_dump_last_success_ts.set(epoch_secs);
+                    store_dump_completed.store(true, std::sync::atomic::Ordering::Release);
+                    info!("periodic dump complete");
+                } else {
+                    warn!("periodic dump had failures; not signaling completion (offsets held)");
+                }
             }
         });
 
@@ -714,14 +890,6 @@ fn stored_to_metadata_batch(entries: &[(i64, &StoredValue)]) -> anyhow::Result<R
                     author_followers_count: af,
                     engagement: e,
                     ..
-                }
-                | IndexRecord::MmMetadata {
-                    has_video: hv,
-                    has_image: hi,
-                    video_duration_ms: vd,
-                    author_followers_count: af,
-                    engagement: e,
-                    ..
                 } => {
                     has_video.push(*hv);
                     video_duration_ms.push(*vd);
@@ -832,6 +1000,68 @@ fn load_post_ids_from_batch(batch: &RecordBatch, target: &mut WindowData, pipeli
                     author_id,
                     post_sid,
                 },
+            );
+        }
+    } else if pipeline == "metadata" {
+        let i64_col = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        };
+        let bool_col = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+        };
+        let i64_at = |col: Option<&Int64Array>, i: usize| {
+            col.filter(|c| c.is_valid(i))
+                .map(|c| c.value(i))
+                .unwrap_or(0)
+        };
+        let bool_at = |col: Option<&BooleanArray>, i: usize| {
+            col.filter(|c| c.is_valid(i))
+                .map(|c| c.value(i))
+                .unwrap_or(false)
+        };
+
+        let has_video = bool_col("has_video");
+        let has_image = bool_col("has_image");
+        let video_duration_ms = i64_col("video_duration_ms");
+        let author_followers_count = i64_col("author_followers_count");
+        let retweet_count = i64_col("retweet_count");
+        let reply_count = i64_col("reply_count");
+        let fav_count = i64_col("fav_count");
+        let quote_count = i64_col("quote_count");
+        let bookmark_count = i64_col("bookmark_count");
+        let view_count = i64_col("view_count");
+        let not_interested_in_count = i64_col("not_interested_in_count");
+        let report_count = i64_col("report_count");
+        let block_count = i64_col("block_count");
+
+        for i in 0..batch.num_rows() {
+            let post_id = post_ids.value(i);
+            let author_id = author_ids.value(i);
+            target.insert(
+                post_id,
+                StoredValue::Full(Arc::new(IndexRecord::Metadata {
+                    post_id,
+                    author_id,
+                    has_video: bool_at(has_video, i),
+                    has_image: bool_at(has_image, i),
+                    video_duration_ms: i64_at(video_duration_ms, i),
+                    author_followers_count: i64_at(author_followers_count, i),
+                    engagement: EngagementCounts {
+                        retweet_count: i64_at(retweet_count, i),
+                        reply_count: i64_at(reply_count, i),
+                        fav_count: i64_at(fav_count, i),
+                        quote_count: i64_at(quote_count, i),
+                        bookmark_count: i64_at(bookmark_count, i),
+                        view_count: i64_at(view_count, i),
+                        not_interested_in_count: i64_at(not_interested_in_count, i),
+                        report_count: i64_at(report_count, i),
+                        block_count: i64_at(block_count, i),
+                    },
+                })),
             );
         }
     } else {
@@ -961,24 +1191,6 @@ fn empty_metadata_batch() -> RecordBatch {
     .expect("empty metadata batch creation cannot fail")
 }
 
-fn write_empty_parquet(
-    output_dir: &std::path::Path,
-    window_name: &str,
-    versions_to_keep: usize,
-    pipeline: &str,
-) -> anyhow::Result<()> {
-    let batch = empty_batch_for_window(window_name, pipeline);
-    let epoch_secs = chrono::Utc::now().timestamp();
-    atomic_write_parquet(
-        output_dir,
-        window_name,
-        epoch_secs,
-        &batch,
-        versions_to_keep,
-    )?;
-    Ok(())
-}
-
 
 pub fn prefix_window_router() -> WindowRouter {
     Box::new(|record: &IndexRecord, windows: &[WindowConfig]| {
@@ -1045,6 +1257,21 @@ mod tests {
         }
     }
 
+    fn make_metadata_record(post_id: i64, author_id: i64, fav_count: i64) -> IndexRecord {
+        IndexRecord::Metadata {
+            post_id,
+            author_id,
+            has_video: false,
+            has_image: false,
+            video_duration_ms: 0,
+            author_followers_count: 0,
+            engagement: crate::processor::record::EngagementCounts {
+                fav_count,
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn prefix_router_routes_to_matching_windows() {
         let windows = vec![
@@ -1089,7 +1316,7 @@ mod tests {
 
     #[test]
     fn topic_router_explicit_mapping() {
-        let windows = vec![]; 
+        let windows = vec![];
         let router = topic_window_router();
 
         let r1 = make_core_record(1, 1, "1fav");
@@ -1132,7 +1359,7 @@ mod tests {
         let config = StoreConfig {
             output_dir: dir.path().to_path_buf(),
             windows: vec![WindowConfig::new("1fav", 24)],
-            compaction_interval_secs: 999, 
+            compaction_interval_secs: 999,
             versions_to_keep: 3,
             pipeline: "main".to_string(),
             sid_num_levels: 6,
@@ -1160,12 +1387,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_keeps_fav_when_later_event_has_zero_engagement() {
+        let dir = TempDir::new().unwrap();
+        let metrics = make_metrics();
+        let config = StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows: vec![WindowConfig::new("metadata", 24)],
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "metadata".to_string(),
+            sid_num_levels: 6,
+        };
+        let store = BaseSnapshotStore::new(config, metadata_window_router(), metrics);
+
+        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let post_id = timestamp_secs_to_snowflake(now_secs - 100.0);
+
+        store
+            .add_batch(vec![make_metadata_record(post_id, 10, 50)])
+            .await
+            .unwrap();
+        store.dump_all_windows().await.unwrap();
+        store
+            .add_batch(vec![make_metadata_record(post_id, 10, 0)])
+            .await
+            .unwrap();
+        store.dump_all_windows().await.unwrap();
+
+        let symlink = dir.path().join("metadata_1day.parquet");
+        let batches = read_parquet_file(&symlink).unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        let favs = batches[0]
+            .column_by_name("fav_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(favs.value(0), 50);
+    }
+
+    #[tokio::test]
+    async fn metadata_reload_preserves_fav() {
+        let dir = TempDir::new().unwrap();
+        let metrics = make_metrics();
+        let config = StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows: vec![WindowConfig::new("metadata", 24)],
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "metadata".to_string(),
+            sid_num_levels: 6,
+        };
+        let store1 = BaseSnapshotStore::new(config, metadata_window_router(), Arc::clone(&metrics));
+
+        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let post_id = timestamp_secs_to_snowflake(now_secs - 100.0);
+        store1
+            .add_batch(vec![IndexRecord::Metadata {
+                post_id,
+                author_id: 10,
+                has_video: false,
+                has_image: true,
+                video_duration_ms: 0,
+                author_followers_count: 99,
+                engagement: crate::processor::record::EngagementCounts {
+                    fav_count: 50,
+                    view_count: 200,
+                    ..Default::default()
+                },
+            }])
+            .await
+            .unwrap();
+        store1.dump_all_windows().await.unwrap();
+
+        let config2 = StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows: vec![WindowConfig::new("metadata", 24)],
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "metadata".to_string(),
+            sid_num_levels: 6,
+        };
+        let store2 = BaseSnapshotStore::new(config2, metadata_window_router(), metrics);
+        store2.load_existing_data().await.unwrap();
+        store2
+            .add_batch(vec![make_metadata_record(post_id, 10, 0)])
+            .await
+            .unwrap();
+        store2.dump_all_windows().await.unwrap();
+
+        let batches = read_parquet_file(&dir.path().join("metadata_1day.parquet")).unwrap();
+        let col = |name: &str| {
+            batches[0]
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col("fav_count"), 50);
+        assert_eq!(col("view_count"), 200);
+        assert_eq!(col("author_followers_count"), 99);
+    }
+
+    #[tokio::test]
     async fn store_retention_filters_old_records() {
         let dir = TempDir::new().unwrap();
         let metrics = make_metrics();
         let config = StoreConfig {
             output_dir: dir.path().to_path_buf(),
-            windows: vec![WindowConfig::new("test", 24)], 
+            windows: vec![WindowConfig::new("test", 24)],
             compaction_interval_secs: 999,
             versions_to_keep: 3,
             pipeline: "main".to_string(),
@@ -1176,7 +1508,7 @@ mod tests {
 
         let now_secs = chrono::Utc::now().timestamp() as f64;
         let recent_id = timestamp_secs_to_snowflake(now_secs - 100.0);
-        let old_id = timestamp_secs_to_snowflake(now_secs - 2.0 * 86400.0); 
+        let old_id = timestamp_secs_to_snowflake(now_secs - 2.0 * 86400.0);
 
         let records = vec![
             make_core_record(recent_id, 10, "test"),
@@ -1395,9 +1727,9 @@ mod tests {
         let store = make_sid_store(&dir);
         store
             .add_batch(vec![
-                make_sid_record(100, 10, vec![]),        
-                make_sid_record(200, 20, vec![1, 2, 3]), 
-                make_sid_record(300, 30, vec![]),        
+                make_sid_record(100, 10, vec![]),
+                make_sid_record(200, 20, vec![1, 2, 3]),
+                make_sid_record(300, 30, vec![]),
             ])
             .await
             .unwrap();
@@ -1411,8 +1743,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = make_sid_store(&dir);
         let now_secs = chrono::Utc::now().timestamp() as f64;
-        let young_pid = timestamp_secs_to_snowflake(now_secs - 60.0); 
-        let old_pid = timestamp_secs_to_snowflake(now_secs - 3600.0 * 5.0); 
+        let young_pid = timestamp_secs_to_snowflake(now_secs - 60.0);
+        let old_pid = timestamp_secs_to_snowflake(now_secs - 3600.0 * 5.0);
         store
             .add_batch(vec![
                 make_sid_record(young_pid, 1, vec![]),
@@ -1454,7 +1786,7 @@ mod tests {
             .await
             .unwrap();
         let mut patch = HashMap::new();
-        patch.insert(999_i64, vec![1, 2, 3]); 
+        patch.insert(999_i64, vec![1, 2, 3]);
         let updated = store.update_sids(patch).await.unwrap();
         assert_eq!(updated, 0, "unknown post_id silently skipped");
     }
@@ -1547,8 +1879,8 @@ mod tests {
         let pid_b = timestamp_secs_to_snowflake(now_secs - 50.0);
         store
             .add_batch(vec![
-                make_sid_record(pid_a, 10, vec![]),                 
-                make_sid_record(pid_b, 20, vec![1, 2, 3, 4, 5, 6]), 
+                make_sid_record(pid_a, 10, vec![]),
+                make_sid_record(pid_b, 20, vec![1, 2, 3, 4, 5, 6]),
             ])
             .await
             .unwrap();

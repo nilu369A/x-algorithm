@@ -12,13 +12,17 @@ from xrex.data.parquet_recsys import (
     PhoenixToyDataset,
 )
 from xrex.data.recsys.constants import continuous_action_type_map
-from xrex.data.recsys.feature_config import CategoricalFeature
+from xrex.data.recsys.feature_config import (
+    WEB_CONV_TRACKING_INTEGRATION_CARDINALITY,
+    CategoricalFeature,
+)
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.models.recsys_feature_prep import FeaturePrepConfig
 from xrex.models.recsys_model import (
+    MATCHED_WORD_FRACTION_NUM_BUCKETS,
     POST_AGE_MAX_MINUTES,
     CategoricalFeatureConfig,
     ContextFeaturesConfig,
@@ -86,6 +90,8 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_codebook_size=mparams.get("sid_codebook_size", 1024),
         sid_hash_level=mparams.get("sid_hash_level", False),
         sid_cross_attn=mparams.get("sid_cross_attn", False),
+        sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
+        sid_decoder_path=mparams.get("sid_decoder_path", ""),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
@@ -196,6 +202,7 @@ def _make_dataset(
     _use_post_sid = mparams.get("use_post_sid", False)
     _sid_num_levels = mparams.get("sid_num_levels", 6)
     _enable_stale_post = mparams.get("enable_stale_post", False)
+    _ads_head_masking = mparams.get("ads_head_masking", False)
 
     match dataset_type:
         case "aggregated_kafka":
@@ -213,6 +220,7 @@ def _make_dataset(
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
+                ads_head_masking=_ads_head_masking,
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -227,6 +235,7 @@ def _make_dataset(
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
+                ads_head_masking=_ads_head_masking,
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -259,6 +268,7 @@ def _home_direct_packed_base() -> dict:
         "compute_post_unexplored_label": True,
         "use_seqpack": True,
         "right_anchored_rope": True,
+        "click_dwell_loss_weight": 1.0,
         "qk_norm": True,
         "attn_logit_cap": -1,
         "primer_norm": False,
@@ -289,6 +299,7 @@ def _home_direct_packed_base() -> dict:
             enable_is_author_followed_by_viewer=True,
             enable_is_author_following_viewer=True,
             enable_engagement_counts=True,
+            enable_click_dwell_time=True,
             hour_of_day_dither_fraction=0.1,
         ),
         "seqpack_distribution": BetaLengthDistribution(
@@ -305,7 +316,7 @@ def _home_direct_packed_base() -> dict:
 _H100_OVERRIDES = {
     "bs_per_device": 256,
     "ep": 256,
-    "attn_impl": "pallas_ranker_varlen_attn",
+    "attn_impl": "cutedsl_ranker_varlen_attn",
     "learning_rate": 7.1e-4,
     "checkpoint_every_n": 150,
     "optim_config": RecsysDenseOptimConfig(
@@ -384,7 +395,6 @@ MODEL_CFGS = {
             "use_seqpack": True,
             "right_anchored_rope": True,
             "compute_post_unexplored_label": True,
-            "multimodal_embedding_type": "v5",
             "seqpack_distribution": BetaLengthDistribution(
                 min_len=126,
                 max_len=1022,
@@ -416,7 +426,9 @@ MODEL_CFGS = {
     "home_direct_packed_nano": _make_cfg(
         {
             **_home_direct_packed_base(),
-            "learning_rate": 2e-3,
+            "learning_rate": _GB300_OVERRIDES["learning_rate"],
+            "optim_config": _GB300_OVERRIDES["optim_config"],
+            "emb_optim_config": _GB300_OVERRIDES["emb_optim_config"],
             "bs_per_device": 64,
             "ep": 1,
             "dp": 1,
@@ -626,6 +638,8 @@ for config in configs:
             sid_codebook_size=mparams.get("sid_codebook_size", 1024),
             sid_hash_level=mparams.get("sid_hash_level", False),
             sid_cross_attn=mparams.get("sid_cross_attn", False),
+            sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
+            sid_decoder_path=mparams.get("sid_decoder_path", ""),
             use_seqpack=mparams["use_seqpack"],
             right_anchored_rope=mparams.get("right_anchored_rope", False),
             user_features=user_features,
@@ -638,10 +652,22 @@ for config in configs:
             mask_candidate_positive_when_negative_action_present=mparams.get(
                 "mask_candidate_positive_when_negative_action_present", False
             ),
+            ads_head_masking=mparams.get("ads_head_masking", False),
+            enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
+            attend_padded_history=mparams.get("attend_padded_history", False),
+            concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
+            mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
+            purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
+            purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
             condition_search_relevance_on_prompt=mparams.get(
                 "condition_search_relevance_on_prompt", False
             ),
             metric_group=mparams.get("metric_group", "default"),
+            enable_platform_metrics=mparams.get("enable_platform_metrics", False),
+            metric_mask_keys=mparams.get("metric_mask_keys"),
+            conversion_delay_slice_thresholds_s=tuple(
+                mparams.get("conversion_delay_slice_thresholds_s", ())
+            ),
             continuous_metrics_mae_mean=mparams.get("continuous_metrics_mae_mean", False),
             emb_table_width=mparams["emb_table_width"],
             history_seq_len=mparams["history_seq_len"],
@@ -670,11 +696,24 @@ for config in configs:
                     ),
                     norm_config=NormConfig(norm_scale=30.0, use_log=False),
                 ),
+                ContinuousActionLossConfig(
+                    action_index=recsys_pb2.ContinuousActionName.CLICK_DWELL_TIME,
+                    metric_name="click-dwell-binary",
+                    loss_weight=mparams.get("click_dwell_loss_weight", 0.0),
+                    loss_type="binary",
+                    binary_threshold=10.0,
+                    norm_config=NormConfig(norm_scale=60.0),
+                ),
             ],
             context_features=ContextFeaturesConfig(
                 enabled=mparams.get("enable_context_features", True),
+                enable_day_of_week=mparams.get("enable_day_of_week", True),
                 enable_engagement_counts=mparams.get("enable_engagement_counts", False),
                 enable_author_nsfw=mparams.get("enable_author_nsfw", False),
+                enable_search_lexical_match=mparams.get("enable_search_lexical_match", False),
+                enable_web_conv_tracking_integration=mparams.get(
+                    "enable_web_conv_tracking_integration", False
+                ),
                 categorical_features=[
                     CategoricalFeatureConfig(
                         feature_name="product_surface",
@@ -719,6 +758,12 @@ for config in configs:
                         embedding_dim=16,
                     ),
                     CategoricalFeatureConfig(
+                        index=CategoricalFeature.webConvTrackingIntegrationSeq,
+                        feature_name="web_conv_tracking_integration",
+                        cardinality=WEB_CONV_TRACKING_INTEGRATION_CARDINALITY,
+                        embedding_dim=8,
+                    ),
+                    CategoricalFeatureConfig(
                         index=CategoricalFeature.favCountBucketSeq,
                         feature_name="fav_count_bucket",
                         cardinality=32,
@@ -746,6 +791,18 @@ for config in configs:
                         index=CategoricalFeature.viewCountBucketSeq,
                         feature_name="view_count_bucket",
                         cardinality=32,
+                        embedding_dim=16,
+                    ),
+                    CategoricalFeatureConfig(
+                        index=CategoricalFeature.exactPhraseSeq,
+                        feature_name="exact_phrase",
+                        cardinality=3,
+                        embedding_dim=16,
+                    ),
+                    CategoricalFeatureConfig(
+                        index=CategoricalFeature.matchedWordFractionBucketSeq,
+                        feature_name="matched_word_fraction_bucket",
+                        cardinality=MATCHED_WORD_FRACTION_NUM_BUCKETS,
                         embedding_dim=16,
                     ),
                 ],
@@ -786,6 +843,7 @@ for config in configs:
             hash_table=hash_table,
         ),
         bs_per_device=mparams["bs_per_device"],
+        num_microbatch=mparams.get("num_microbatch", 1),
         seqpack_distribution=seqpack_distribution,
         dataset=dataset,
         parallel_config=ParallelConfig(

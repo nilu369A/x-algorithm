@@ -12,7 +12,6 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.lax import with_sharding_constraint
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -33,6 +32,7 @@ from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
 from xrex.utils import layer_stack
 from xrex.utils.gpu import peak_tflops
+from xrex.utils.sharding import with_sharding_constraint
 from xrex.utils.utils import (
     dump_block_outputs,
     ffn_size,
@@ -521,10 +521,7 @@ class DecoderLayer(hk.Module):
         else:
             layer_dumps = (0,)
 
-        return DecoderOutput(
-            output=residual,
-            layer_dumps=layer_dumps,
-        )
+        return DecoderOutput(output=residual, layer_dumps=layer_dumps)
 
 
 def layer_stack_block(
@@ -575,10 +572,7 @@ def layer_stack_block(
             concatenated_dumps.append(jnp.stack(dumps, axis=0))
         layer_dumps = tuple(concatenated_dumps)
 
-    return h, DecoderOutput(
-        output=jnp.zeros(()),
-        layer_dumps=layer_dumps,
-    )
+    return h, DecoderOutput(output=jnp.zeros(()), layer_dumps=layer_dumps)
 
 
 @dataclass

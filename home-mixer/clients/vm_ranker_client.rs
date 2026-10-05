@@ -11,7 +11,7 @@ use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 use xai_vm_ranker_proto::vm_ranker_service_client::VmRankerServiceClient;
 use xai_vm_ranker_proto::{RankRequest, RankResponse};
 use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
-use xai_x_rpc::grpc_client::insecure_tls_config;
+use xai_x_rpc::grpc_client::{insecure_tls_config, Dscp};
 use xai_x_rpc::service_probe::KeepAlive;
 use xai_x_rpc::xds_endpoint_source::XdsEndpointSource;
 use xai_xds_client::{ServiceState, StartFrom, XdsClient};
@@ -41,6 +41,8 @@ pub enum VMRankerCluster {
     Experiment4,
     #[strum(props(host = "experiment-5.prod.fou"))]
     Experiment5,
+    #[strum(props(host = "experiment-6.prod.fou"))]
+    Experiment6,
 }
 
 impl VMRankerCluster {
@@ -125,13 +127,13 @@ impl VMRankerClient for ProdVMRankerClient {
             let cluster_label = format!("{cluster:?}");
             let result_label = if result.is_ok() { "success" } else { "failure" };
             let scope = [
-                ("cluster", cluster_label.as_str()),
+                ("vm_cluster", cluster_label.as_str()),
                 ("result", result_label),
             ];
             receiver.incr(METRIC_NAME, &scope, 1);
             receiver.observe(
                 METRIC_NAME,
-                &[("cluster", cluster_label.as_str())],
+                &[("vm_cluster", cluster_label.as_str())],
                 latency_ms,
                 HistogramBuckets::Bucket500To1000,
             );
@@ -185,6 +187,7 @@ impl XdsVMRankerClient {
                             Some(h2_initial_connection_window),
                         )
                         .socket_buffer_bytes(Some(socket_buffer_bytes))
+                        .dscp(Some(Dscp::InferenceCritical))
                         .keep_alive(KeepAlive {
                             interval: Some(Duration::from_secs(30)),
                             timeout: Some(Duration::from_secs(10)),
@@ -267,7 +270,7 @@ impl XdsVMRankerClient {
             let cluster_label = format!("{cluster:?}");
             let result_label = if built { "built" } else { "skipped" };
             let scope = [
-                ("cluster", cluster_label.as_str()),
+                ("vm_cluster", cluster_label.as_str()),
                 ("result", result_label),
             ];
             receiver.incr(XDS_BUILD_METRIC_NAME, &scope, 1);
@@ -289,7 +292,7 @@ impl XdsVMRankerClient {
                 if let Some(receiver) = global_stats_receiver() {
                     receiver.gauge(
                         XDS_ENDPOINTS_METRIC_NAME,
-                        &[("cluster", cluster_label.as_str())],
+                        &[("vm_cluster", cluster_label.as_str())],
                         count as f64,
                     );
                 }
@@ -329,13 +332,13 @@ impl VMRankerClient for XdsVMRankerClient {
             let cluster_label = format!("{cluster:?}");
             let result_label = if result.is_ok() { "success" } else { "failure" };
             let scope = [
-                ("cluster", cluster_label.as_str()),
+                ("vm_cluster", cluster_label.as_str()),
                 ("result", result_label),
             ];
             receiver.incr(XDS_METRIC_NAME, &scope, 1);
             receiver.observe(
                 XDS_METRIC_NAME,
-                &[("cluster", cluster_label.as_str())],
+                &[("vm_cluster", cluster_label.as_str())],
                 latency_ms,
                 HistogramBuckets::Bucket500To1000,
             );

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import dataclasses
+import functools
 import logging
 import os
 import re
@@ -37,6 +38,7 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
+from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
     NUM_USER_INSTALLED_APPS,
@@ -46,6 +48,7 @@ from xrex.data.recsys.recsys_batch import (
     PostEmbeddingTable,
     PostSeq,
     RecsysFeaturesBatch,
+    empty_conversion_delays,
     empty_feature_arrays,
     empty_user_feature_arrays,
     from_record_batch,
@@ -240,6 +243,109 @@ def _extract_partition_id(file_path: str) -> int | None:
     return None
 
 
+_SHUFFLE_READ_CHUNK_ROWS = 1 << 16
+_SHUFFLE_PREFETCH_FILES = 2
+
+
+def _shuffle_window_end(window_start: int, window: int) -> int:
+    return (window_start // window + 1) * window
+
+
+def _shuffled_remaining_batches(
+    *,
+    start_bid: int,
+    end_bid: int,
+    window: int,
+    rows_per_bid: int,
+    batch_size: int,
+    resume_bid: int | None = None,
+    resume_rows: int = 0,
+) -> int:
+    window_start, skip = start_bid, 0
+    if resume_bid is not None and resume_bid >= start_bid:
+        window_start, skip = resume_bid, resume_rows
+    total = 0
+    while window_start < end_bid:
+        window_end = min(_shuffle_window_end(window_start, window), end_bid)
+        rows = max(0, (window_end - window_start) * rows_per_bid - skip)
+        skip = 0
+        full, rem = divmod(rows, batch_size)
+        total += full + (1 if rem * 2 >= batch_size and rem > 0 else 0)
+        window_start = window_end
+    return total
+
+
+def _same_schema(a: pa.RecordBatch, b: pa.RecordBatch) -> bool:
+    return a.schema.equals(b.schema, check_metadata=False)
+
+
+@final
+class _RowShuffleBuffer:
+    def __init__(self, capacity_rows: int, rng: np.random.Generator):
+        self._capacity = capacity_rows
+        self._rng = rng
+        self._batches: list[pa.RecordBatch] = []
+        self._rows = 0
+
+    def add(self, batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
+        if self._capacity == 0:
+            yield batch
+            return
+        if batch.num_rows == 0:
+            return
+        if self._batches and not _same_schema(batch, self._batches[0]):
+            yield from self.flush()
+        self._batches.append(batch)
+        self._rows += batch.num_rows
+        if self._rows >= self._capacity:
+            yield from self._emit(keep=self._capacity // 2)
+
+    def flush(self) -> Iterator[pa.RecordBatch]:
+        if self._rows > 0:
+            yield from self._emit(keep=0)
+
+    def _emit(self, keep: int) -> Iterator[pa.RecordBatch]:
+        merged = pa.concat_batches(self._batches)
+        merged = merged.take(pa.array(self._rng.permutation(merged.num_rows)))
+        n_emit = merged.num_rows - keep
+        rest = merged.slice(n_emit)
+        self._batches = [rest] if rest.num_rows else []
+        self._rows = rest.num_rows
+        yield merged.slice(0, n_emit)
+
+
+@final
+class _Rebatcher:
+    def __init__(self, batch_size: int):
+        self._batch_size = batch_size
+        self._pending: list[pa.RecordBatch] = []
+        self._rows = 0
+
+    def add(self, chunk: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
+        if chunk.num_rows == 0:
+            return
+        if self._pending and not _same_schema(chunk, self._pending[0]):
+            yield from self.flush()
+        self._pending.append(chunk)
+        self._rows += chunk.num_rows
+        if self._rows < self._batch_size:
+            return
+        merged = pa.concat_batches(self._pending)
+        n_full = (merged.num_rows // self._batch_size) * self._batch_size
+        rest = merged.slice(n_full)
+        self._pending = [rest] if rest.num_rows else []
+        self._rows = rest.num_rows
+        for i in range(0, n_full, self._batch_size):
+            yield merged.slice(i, self._batch_size)
+
+    def flush(self) -> Iterator[pa.RecordBatch]:
+        if self._rows > 0:
+            merged = pa.concat_batches(self._pending)
+            self._pending = []
+            self._rows = 0
+            yield merged
+
+
 @final
 class InterleavingRecordBatchProvider:
     def __init__(
@@ -262,11 +368,32 @@ class InterleavingRecordBatchProvider:
         max_timestamp_ms: int | None = None,
         conversion_delay_columns: list[str] | None = None,
         include_action_delay_columns: bool = False,
+        shuffle_window_time_slices: int = 0,
+        shuffle_in_memory_buffer_rows: int = 0,
+        shuffle_seed: int = 0,
     ):
         self._conversion_delay_columns = conversion_delay_columns
         self._include_action_delay_columns = include_action_delay_columns
         if metadata_path is None and index_path is None:
             raise ValueError("Either metadata_path or index_path must be provided")
+
+        if shuffle_window_time_slices < 0 or shuffle_in_memory_buffer_rows < 0:
+            raise ValueError(
+                f"shuffle_window_time_slices ({shuffle_window_time_slices}) and "
+                f"shuffle_in_memory_buffer_rows ({shuffle_in_memory_buffer_rows}) must be >= 0"
+            )
+        if shuffle_in_memory_buffer_rows > 0 and shuffle_window_time_slices == 0:
+            raise ValueError(
+                "shuffle_in_memory_buffer_rows requires shuffle_window_time_slices > 0"
+            )
+        if shuffle_window_time_slices > 0:
+            if metadata_path is None:
+                raise ValueError("shuffle requires metadata mode (.valid_batches.json)")
+            if continuous:
+                raise ValueError("shuffle is not supported with continuous=True")
+        self._shuffle_window_time_slices = shuffle_window_time_slices
+        self._shuffle_in_memory_buffer_rows = shuffle_in_memory_buffer_rows
+        self._shuffle_seed = shuffle_seed
 
         if resume_position is not None and metadata_path is None:
             raise ValueError(
@@ -316,6 +443,10 @@ class InterleavingRecordBatchProvider:
             if max_timestamp_ms is not None:
                 self._end_batch_id = end_batch_id
 
+        self._shuffle_skip_rows: int = 0
+        self._shuffle_skip_spans_windows: bool = False
+        self._rows_in_window: int = 0
+
         if resume_position is not None:
             resume_bid = resume_position["last_batch_id"]
             resume_in_range = resume_bid >= start_batch_id and (
@@ -349,6 +480,7 @@ class InterleavingRecordBatchProvider:
                     self._record_batches_to_skip = adjusted_reads
                 else:
                     self._record_batches_to_skip = saved_reads
+                self._shuffle_skip_rows = saved_reads * (saved_batch_size or batch_size)
 
                 rank_logger.info(
                     "Resuming from DataPosition: batch_id=%d, rows_read_in_batch=%d, "
@@ -385,6 +517,8 @@ class InterleavingRecordBatchProvider:
         else:
             self._next_batch_id = start_batch_id
             self._record_batches_to_skip = skip_rows // (batch_size * num_shards)
+            self._shuffle_skip_rows = self._record_batches_to_skip * batch_size
+            self._shuffle_skip_spans_windows = True
             rank_logger.info(
                 f"Skipping {self._record_batches_to_skip=}: {skip_rows=} {batch_size=} {num_shards=}"
             )
@@ -607,9 +741,146 @@ class InterleavingRecordBatchProvider:
                 _fill_active_blocking()
 
     def get_record_batches(self) -> Iterator[pa.RecordBatch]:
-        yield from self._get_record_batches_synced()
+        if self._shuffle_window_time_slices > 0:
+            yield from self._get_record_batches_shuffled()
+        else:
+            yield from self._get_record_batches_synced()
+
+    def _read_whole_file(self, file: str) -> list[pa.RecordBatch]:
+        path = _resolve_file_path(self._path, file)
+        try:
+            holder = LazyRecordBatchIterator(
+                ParquetFile(path),
+                _SHUFFLE_READ_CHUNK_ROWS,
+                path,
+                self._conversion_delay_columns,
+                self._include_action_delay_columns,
+            )
+        except Exception as e:
+            if "No such file or directory" in str(e):
+                rank_logger.warning(f"Skipping missing file {file}")
+                return []
+            raise ValueError(f"Error processing file {file}: {e}") from e
+        chunks = []
+        while (chunk := self._safe_read(holder)) is not None:
+            chunks.append(chunk)
+        return chunks
+
+    def _shuffled_window_outputs(
+        self,
+        files: list[str],
+        buffer: "_RowShuffleBuffer",
+        pool: ThreadPoolExecutor,
+        prefetch: int,
+    ) -> Iterator[pa.RecordBatch]:
+        rebatcher = _Rebatcher(self._batch_size)
+
+        def _skip_then_rebatch(rows: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
+            if self._shuffle_skip_rows > 0:
+                n = min(self._shuffle_skip_rows, rows.num_rows)
+                self._shuffle_skip_rows -= n
+                self._rows_in_window += n
+                rows = rows.slice(n)
+            for out in rebatcher.add(rows):
+                self._rows_in_window += out.num_rows
+                yield out
+
+        in_flight: deque[Future[list[pa.RecordBatch]]] = deque()
+        file_iter = iter(files)
+        for f in file_iter:
+            in_flight.append(pool.submit(self._read_whole_file, f))
+            if len(in_flight) >= prefetch:
+                break
+        while in_flight:
+            chunks = in_flight.popleft().result()
+            next_file = next(file_iter, None)
+            if next_file is not None:
+                in_flight.append(pool.submit(self._read_whole_file, next_file))
+            for chunk in chunks:
+                for rows in buffer.add(chunk):
+                    yield from _skip_then_rebatch(rows)
+        for rows in buffer.flush():
+            yield from _skip_then_rebatch(rows)
+        for out in rebatcher.flush():
+            self._rows_in_window += out.num_rows
+            yield out
+
+    def _get_record_batches_shuffled(self) -> Iterator[pa.RecordBatch]:
+        assert self._metadata_path is not None
+        self._record_batches_to_skip = 0
+        window_start = self._next_batch_id
+        prefetch = min(_SHUFFLE_PREFETCH_FILES, max(1, self._interleave_k))
+
+        pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="shuffle_read_parquet")
+        try:
+            while True:
+                meta = _load_valid_batches_metadata(self._metadata_path)
+                if meta is None:
+                    return
+                end = meta["max_valid_batch"] + 1
+                if self._end_batch_id is not None:
+                    end = min(end, self._end_batch_id)
+                min_valid = meta["min_valid_batch"]
+                if _shuffle_window_end(window_start, self._shuffle_window_time_slices) <= min_valid:
+                    if self._shuffle_skip_rows > 0:
+                        rank_logger.warning(
+                            "TTL advanced past window start %d (first available: %d); "
+                            "clearing %d stale skip rows",
+                            window_start,
+                            min_valid,
+                            self._shuffle_skip_rows,
+                        )
+                        self._shuffle_skip_rows = 0
+                    window_start = max(window_start, min_valid)
+                if window_start >= end:
+                    return
+
+                window_end = min(
+                    _shuffle_window_end(window_start, self._shuffle_window_time_slices), end
+                )
+                entries = [
+                    (bid, _batch_path(self._topic_dir, p, bid))
+                    for bid in range(window_start, window_end)
+                    for p in range(meta["num_partitions"])
+                    if p % self._num_shards == self._shard_index
+                ]
+                rng = np.random.default_rng((self._shuffle_seed, self._shard_index, window_start))
+                order = rng.permutation(len(entries))
+                files = [entries[i][1] for i in order if entries[i][0] >= min_valid]
+
+                self._current_drain_batch_id = window_start
+                self._rows_in_window = 0
+                rank_logger.info(
+                    f"Shard {self._shard_index}: shuffled window [{window_start}, {window_end}), "
+                    f"{len(files)} files, buffer_rows={self._shuffle_in_memory_buffer_rows}, "
+                    f"skip_rows={self._shuffle_skip_rows}"
+                )
+
+                buffer = _RowShuffleBuffer(self._shuffle_in_memory_buffer_rows, rng)
+                yield from self._shuffled_window_outputs(files, buffer, pool, prefetch)
+
+                if self._shuffle_skip_rows > 0 and not self._shuffle_skip_spans_windows:
+                    rank_logger.warning(
+                        "Window [%d, %d) ended with %d resume skip rows left; not carrying "
+                        "them into the next window",
+                        window_start,
+                        window_end,
+                        self._shuffle_skip_rows,
+                    )
+                    self._shuffle_skip_rows = 0
+
+                window_start = window_end
+                self._next_batch_id = window_end
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def get_position(self) -> DataPosition:
+        if self._shuffle_window_time_slices > 0:
+            return DataPosition(
+                last_batch_id=self._current_drain_batch_id,
+                rows_read_in_batch=self._rows_in_window,
+                batch_size=1,
+            )
         rank_logger.debug(
             "Saving data position: batch_id=%d, rows_read=%d, batch_size=%d, "
             "total_rows=%d, shard_index=%d, num_shards=%d",
@@ -767,6 +1038,24 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         )
 
     def pad_post_seq(post_seq: PostSeq) -> PostSeq:
+        padded = _pad_post_seq_fields(post_seq)
+        if (_tcm := post_seq.get("trained_candidate_mask")) is not None:
+            padded["trained_candidate_mask"] = np.pad(
+                _tcm, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=True
+            )
+        if (value_valid := post_seq.get("value_label_valid")) is not None:
+            padded["value_label_valid"] = pad_array(value_valid)
+        if (value_baseline := post_seq.get("value_baseline_mean_usd")) is not None:
+            padded["value_baseline_mean_usd"] = pad_array(value_baseline)
+        if (delays := post_seq.get("conversion_delay_ms")) is not None:
+            padded["conversion_delay_ms"] = np.pad(
+                delays,
+                ((0, batch_size - num_rows), (0, 0), (0, 0)),
+                constant_values=CONVERSION_DELAY_NONE,
+            )
+        return padded
+
+    def _pad_post_seq_fields(post_seq: PostSeq) -> PostSeq:
         return PostSeq(
             impr_ts=pad_array(post_seq["impr_ts"]) if post_seq["impr_ts"] is not None else None,
             actions=pad_array(post_seq["actions"]) if post_seq["actions"] is not None else None,
@@ -817,6 +1106,9 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         else None,
         "sample_weights": pad_array(sw)
         if (sw := batch_unpadded.get("sample_weights")) is not None
+        else None,
+        "sample_source": pad_array(ss)
+        if (ss := batch_unpadded.get("sample_source")) is not None
         else None,
     }
 
@@ -870,6 +1162,8 @@ class PhoenixDataset(Dataset):
     compute_post_unexplored_label: bool = False
     enable_stale_post: bool = False
 
+    ads_head_masking: bool = False
+
     multimodal_embedding_type: EmbeddingType | None = None
 
     use_conversion_labels: bool = False
@@ -889,6 +1183,10 @@ class PhoenixDataset(Dataset):
     filter_candidates_require_embedding: bool = False
 
     continuous: bool = False
+
+    shuffle_window_time_slices: int = 0
+    shuffle_in_memory_buffer_rows: int = 0
+    shuffle_seed: int = 0
 
     @staticmethod
     def _parse_date_bound(s: str) -> int | None:
@@ -925,6 +1223,36 @@ class PhoenixDataset(Dataset):
 
         sample_path = _batch_path(topic_dir, 0, start_bid)
         dump_rows = pq.ParquetFile(sample_path).metadata.num_rows
+        if self.shuffle_window_time_slices > 0 and not self.is_eval:
+            count = functools.partial(
+                _shuffled_remaining_batches,
+                start_bid=start_bid,
+                end_bid=end_bid,
+                window=self.shuffle_window_time_slices,
+                rows_per_bid=files_per_shard * dump_rows,
+                batch_size=batch_size,
+            )
+            total_batches = count()
+            remaining = total_batches
+            if resume_position is not None:
+                saved_bs = resume_position.get("batch_size") or batch_size
+                remaining = count(
+                    resume_bid=resume_position["last_batch_id"],
+                    resume_rows=resume_position["rows_read_in_batch"] * saved_bs,
+                )
+            consumed = total_batches - remaining
+            data_end_step = current_step + remaining - 1
+            rank_logger.info(
+                "compute_max_steps (shuffled): %d (current_step=%d + %d remaining "
+                "of %d total batches, consumed=%d)",
+                data_end_step,
+                current_step,
+                remaining,
+                total_batches,
+                consumed,
+            )
+            return data_end_step
+
         chunks_per_file = dump_rows // batch_size
         batches_per_bid = files_per_shard * chunks_per_file
         total_batches = (end_bid - start_bid) * batches_per_bid
@@ -1052,6 +1380,9 @@ class PhoenixDataset(Dataset):
                     min_timestamp_ms = self._parse_date_bound(self.date_range[0])
                     max_timestamp_ms = self._parse_date_bound(self.date_range[1])
 
+                shuffle_window = 0 if self.is_eval else self.shuffle_window_time_slices
+                shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
+
                 if os.path.isfile(metadata_path):
                     rank_logger.info(f"Using metadata mode: {metadata_path}")
                     rb_provider = InterleavingRecordBatchProvider(
@@ -1071,8 +1402,16 @@ class PhoenixDataset(Dataset):
                         conversion_delay_columns=conversion_delay_columns,
                         include_action_delay_columns=self.use_conversion_labels
                         and self.fold_conversion_actions_into_multihot,
+                        shuffle_window_time_slices=shuffle_window,
+                        shuffle_in_memory_buffer_rows=shuffle_buffer,
+                        shuffle_seed=self.shuffle_seed,
                     )
                 else:
+                    if shuffle_window > 0:
+                        raise ValueError(
+                            f"shuffle_window_time_slices needs metadata mode; {metadata_path} "
+                            "does not exist"
+                        )
                     if resume_position is not None:
                         rank_logger.warning(
                             "resume_position was provided but dataset is in index mode; "
@@ -1155,6 +1494,7 @@ class PhoenixDataset(Dataset):
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
+                        ads_head_masking=self.ads_head_masking,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -1275,6 +1615,9 @@ class PhoenixDataset(Dataset):
             "sample_weights": jax.ShapeDtypeStruct(sw.shape, sw.dtype)
             if (sw := example_data.get("sample_weights")) is not None
             else None,
+            "sample_source": jax.ShapeDtypeStruct(ss.shape, ss.dtype)
+            if (ss := example_data.get("sample_source")) is not None
+            else None,
         }
 
         return batch_shape
@@ -1347,6 +1690,12 @@ class PhoenixDataset(Dataset):
                 ),
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones(
+                    (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
+                ),
+                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
+                conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
                 else None,
@@ -1381,6 +1730,7 @@ class PhoenixDataset(Dataset):
             and self.candidate_negative_filter != CandidateNegativeFilter.NONE
             else None,
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
+            sample_source=np.zeros((batch_size, 1), dtype=np.int8),
         )
         return batch
 
@@ -1476,6 +1826,12 @@ class PhoenixToyDataset(PhoenixDataset):
                 auth_hashes=self.hash_table.get_author_hash(candidate_author_ids),
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones(
+                    (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
+                ),
+                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
+                conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids
                 else None,

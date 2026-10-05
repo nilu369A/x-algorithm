@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
 use crate::model_config::ModelConfig;
-use arrow::array::{Array, AsArray, BooleanArray, Float32Array, Int32Array, Int64Array};
+use arrow::array::{
+    Array, AsArray, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+};
 use arrow::ipc::reader::StreamReader;
 use half::f16;
 use lazy_static::lazy_static;
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xai_recsys_proto as pb;
@@ -24,6 +27,75 @@ lazy_static! {
         &["sequence", "status"]
     )
     .unwrap();
+}
+
+pub const WEB_CONV_FAKE_TWEET_ID: i64 = 4;
+
+pub fn is_web_conv_row(tweet_id: i64, has_conv_bit: bool) -> bool {
+    tweet_id == WEB_CONV_FAKE_TWEET_ID || has_conv_bit
+}
+
+pub fn conv_asset_map(ids: Option<&pb::ConvAssetIds>) -> HashMap<(i64, i64), i64> {
+    ids.filter(|ids| {
+        ids.asset_id.len() == ids.author_id.len()
+            && ids.asset_id.len() == ids.impressed_time_ms.len()
+    })
+    .map(|ids| {
+        (0..ids.asset_id.len())
+            .filter(|&i| ids.asset_id[i] > 0)
+            .map(|i| {
+                (
+                    (ids.author_id[i], ids.impressed_time_ms[i]),
+                    ids.asset_id[i],
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+pub fn conv_asset_ids_for_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    map: &HashMap<(i64, i64), i64>,
+) -> Vec<i64> {
+    let n = batch.num_rows();
+    let mut out = vec![0i64; n];
+    if map.is_empty() {
+        return out;
+    }
+    let col_i64 = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+    };
+    let (Some(tweet_ids), Some(author_ids), Some(impressed_ms)) = (
+        col_i64("tweetId"),
+        col_i64("authorId"),
+        col_i64("impressedTimeMs"),
+    ) else {
+        return out;
+    };
+    let conv_bit = pb::ActionName::AdsWebConversion as usize;
+    let multi_hot = batch
+        .column_by_name("actionNameMultiHot")
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+        .filter(|fsl| conv_bit < fsl.value_length() as usize);
+    let (bools, vocab) = match multi_hot {
+        Some(fsl) => (
+            fsl.values().as_any().downcast_ref::<BooleanArray>(),
+            fsl.value_length() as usize,
+        ),
+        None => (None, 0),
+    };
+    for (row, slot) in out.iter_mut().enumerate() {
+        let has_conv_bit = bools.is_some_and(|b| b.value(row * vocab + conv_bit));
+        if is_web_conv_row(tweet_ids.value(row), has_conv_bit)
+            && let Some(&asset_id) = map.get(&(author_ids.value(row), impressed_ms.value(row)))
+        {
+            *slot = asset_id;
+        }
+    }
+    out
 }
 
 pub fn record_sid_coverage(sequence: &str, present: u64, count: u64) {
@@ -52,8 +124,9 @@ use crate::feature_config::bool_feature::{
     IS_AUTHOR_FOLLOWING_VIEWER_SEQ, IS_AUTHOR_FOLLOWING_VIEWER_SEQ_COLUMN, IS_STALE_POST14D,
 };
 use crate::feature_config::categorical_feature::{
-    AUTHOR_IS_NSFW_SEQ, LOCAL_DAY_OF_WEEK_SEQ, LOCAL_HOUR_OF_DAY_SEQ, PRODUCT_SURFACE_SEQ,
-    PRODUCT_SURFACE_SEQ_COLUMN, TIMEZONE_SEQ,
+    AUTHOR_IS_NSFW_SEQ, EXACT_PHRASE_SEQ, LOCAL_DAY_OF_WEEK_SEQ, LOCAL_HOUR_OF_DAY_SEQ,
+    PRODUCT_SURFACE_SEQ, PRODUCT_SURFACE_SEQ_COLUMN, TIMEZONE_SEQ,
+    WEB_CONV_TRACKING_INTEGRATION_SEQ, WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN,
 };
 #[cfg(recsys_ads_dpa)]
 use crate::feature_config::constants::{
@@ -61,10 +134,13 @@ use crate::feature_config::constants::{
     ADS_PRODUCT_KEY_HASH_SCALE, ADS_PRODUCT_KEY_HASH_SCALE_2, ADS_PRODUCT_KEY_TABLE_SIZE,
     STALE_POST_14D_TTL_SEC,
 };
+use crate::feature_config::float_feature::MATCHED_WORD_FRACTION_SEQ;
 use crate::feature_config::int64_feature::{
     FAV_COUNT_SEQ, FAV_COUNT_SEQ_COLUMN, QUOTE_COUNT_SEQ, QUOTE_COUNT_SEQ_COLUMN, REPLY_COUNT_SEQ,
     REPLY_COUNT_SEQ_COLUMN, REPOST_COUNT_SEQ, REPOST_COUNT_SEQ_COLUMN, VIEW_COUNT_SEQ,
-    VIEW_COUNT_SEQ_COLUMN,
+    VIEW_COUNT_SEQ_COLUMN, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ,
+    WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ,
+    WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN,
 };
 #[cfg(recsys_ads_dpa)]
 use crate::feature_config::int64_feature::{FIRST_DPA_PRODUCT_KEY, FIRST_DPA_PRODUCT_KEY_HASH2};
@@ -74,8 +150,29 @@ const TIMEZONE_IDX: usize = TIMEZONE_SEQ;
 const LOCAL_HOUR_IDX: usize = LOCAL_HOUR_OF_DAY_SEQ;
 const LOCAL_DOW_IDX: usize = LOCAL_DAY_OF_WEEK_SEQ;
 pub const AUTHOR_IS_NSFW_CATEGORICAL_IDX: usize = AUTHOR_IS_NSFW_SEQ;
+pub const EXACT_PHRASE_CATEGORICAL_IDX: usize = EXACT_PHRASE_SEQ;
 
 const AUTHOR_NSFW_BIT: u64 = 2;
+
+fn exact_phrase_categorical(lexical_match: Option<&pb::SearchLexicalMatch>) -> i32 {
+    match lexical_match {
+        Some(m) => 1 + m.exact_phrase as i32,
+        None => 0,
+    }
+}
+
+fn stamp_matched_word_fraction(
+    dest: &mut [f32],
+    num_features: usize,
+    entry_idx: usize,
+    lexical_match: Option<&pb::SearchLexicalMatch>,
+) {
+    if let Some(m) = lexical_match
+        && num_features > MATCHED_WORD_FRACTION_SEQ
+    {
+        dest[entry_idx * num_features + MATCHED_WORD_FRACTION_SEQ] = m.matched_word_fraction;
+    }
+}
 
 fn stamp_engagement_counts(
     dest: &mut [i64],
@@ -281,6 +378,7 @@ pub struct UserFeatures {
     pub installed_apps: Vec<bool>,
 }
 
+#[derive(Default)]
 pub struct InputBuffer {
     pub user_hashes: Vec<i32>,
     pub user_ip_hashes: Vec<i32>,
@@ -331,6 +429,30 @@ pub struct InputBuffer {
     pub num_history: usize,
 }
 
+pub fn repeat_query_into(dest: &mut [f32], query: &[f32], n_slots: usize) {
+    let dim = query.len();
+    if dim == 0 || dest.is_empty() || n_slots == 0 {
+        return;
+    }
+    let max_slots = dest.len() / dim;
+    let n = n_slots.min(max_slots);
+    for i in 0..n {
+        let off = i * dim;
+        dest[off..off + dim].copy_from_slice(query);
+    }
+}
+
+impl InputBuffer {
+    pub fn num_real_candidates(&self, num_item_hashes: usize, cap: usize) -> usize {
+        let w = num_item_hashes.max(1);
+        self.candidate_post_hashes
+            .chunks(w)
+            .take(cap)
+            .take_while(|ch| ch.first().is_some_and(|&h| h != 0))
+            .count()
+    }
+}
+
 struct CandidateData {
     post_hashes: Vec<i32>,
     auth_hashes: Vec<i32>,
@@ -358,7 +480,7 @@ impl InputBuffer {
         let num_author_hashes = model_config.hash_table.num_author_hashes();
         let num_item_hashes = model_config.hash_table.num_item_hashes();
         let candidate_seq_len = model_config.candidate_seq_len;
-        let search_query_embedding_dim = model_config.hash_table.search_query_embedding_dim;
+        let search_query_embedding_dim = model_config.search_query_embedding_dim;
 
         let mut candidate_post_hashes = vec![0i32; candidate_seq_len * num_item_hashes];
         let mut candidate_auth_hashes = vec![0i32; candidate_seq_len * num_author_hashes];
@@ -424,19 +546,19 @@ impl InputBuffer {
             record_sid_coverage("candidate", present, candidates_to_process as u64);
         }
 
-        let mut candidate_search_query_embeddings =
-            vec![0.0f32; candidate_seq_len * search_query_embedding_dim];
-        if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
-            let provided_dim = candidate_set.search_query_embedding.len();
-            if provided_dim == search_query_embedding_dim {
-                for j in 0..candidates_to_process {
-                    let base_idx = j * search_query_embedding_dim;
-                    candidate_search_query_embeddings
-                        [base_idx..base_idx + search_query_embedding_dim]
-                        .copy_from_slice(&candidate_set.search_query_embedding);
-                }
+        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
+            && candidate_set.search_query_embedding.len() == search_query_embedding_dim
+        {
+            candidate_set.search_query_embedding.clone()
+        } else {
+            if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+                log::error!(
+                    "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving empty",
+                    candidate_set.search_query_embedding.len()
+                );
             }
-        }
+            Vec::new()
+        };
 
         let n_post_cat = model_config.hash_table.num_post_categorical_features;
         let n_post_bool = model_config.hash_table.num_post_bool_features;
@@ -465,9 +587,11 @@ impl InputBuffer {
         );
 
         let mut candidate_int64_features = vec![0i64; candidate_seq_len * n_post_int64];
+        let mut candidate_float_features = vec![0.0f32; candidate_seq_len * n_post_float];
         let mut candidate_is_author_followed = vec![false; candidate_seq_len];
         let mut candidate_is_author_following = vec![false; candidate_seq_len];
         let mut candidate_is_stale_post = vec![false; candidate_seq_len];
+        let mut candidate_exact_phrase = vec![0i32; candidate_seq_len];
         let mut candidate_bool_features = vec![false; candidate_seq_len * n_post_bool];
 
         let stale_post_enabled = model_config.hash_table.enable_stale_post;
@@ -528,7 +652,22 @@ impl InputBuffer {
                 .as_ref()
                 .and_then(|ai| ai.is_following_user)
                 .unwrap_or(false);
+            let lexical_match = candidate.search_lexical_match.as_ref();
+            candidate_exact_phrase[j] = exact_phrase_categorical(lexical_match);
+            stamp_matched_word_fraction(
+                &mut candidate_float_features,
+                n_post_float,
+                j,
+                lexical_match,
+            );
         }
+
+        stamp_i32_as_categorical(
+            &candidate_exact_phrase,
+            &mut categorical_features,
+            n_post_cat,
+            EXACT_PHRASE_CATEGORICAL_IDX,
+        );
 
         let candidate_author_is_nsfw: Vec<i32> = candidate_set
             .candidates
@@ -570,7 +709,7 @@ impl InputBuffer {
             search_query_embeddings: candidate_search_query_embeddings,
             categorical_features,
             bool_features: candidate_bool_features,
-            float_features: vec![0.0f32; candidate_seq_len * n_post_float],
+            float_features: candidate_float_features,
             int64_features: candidate_int64_features,
             impr_ts: candidate_impr_ts,
             post_creation_ts_sec: candidate_post_creation_ts_sec,
@@ -631,11 +770,7 @@ impl InputBuffer {
         if let Some(ctx) = user_ctx {
             categorical_features[USER_STATE] = ctx.user_state as i16;
             record_fill("user_state", ctx.user_state != 0);
-            categorical_features[USER_GENDER] = match pb::Gender::try_from(ctx.user_gender) {
-                Ok(pb::Gender::Male) => 2,
-                Ok(pb::Gender::Female) => 1,
-                _ => 0,
-            };
+            categorical_features[USER_GENDER] = ctx.user_gender as i16;
             record_fill("gender", categorical_features[USER_GENDER] != 0);
             categorical_features[USER_AGE_BRACKET] = ctx.user_age_bracket as i16;
             record_fill("age_bracket", ctx.user_age_bracket != 0);
@@ -1074,6 +1209,7 @@ impl InputBuffer {
         let mut history_impr_ts = vec![0i32; history_seq_len];
         let mut history_post_creation_ts_sec = vec![0i32; history_seq_len];
         let mut history_tz_enums = vec![0i16; history_seq_len];
+        let mut history_web_conv_tracking_integration = vec![0i32; history_seq_len];
         let mut history_post_ids = vec![0i64; history_seq_len];
         let mut history_int64_features = vec![0i64; history_seq_len * n_post_int64];
         let mut history_is_author_followed = vec![false; history_seq_len];
@@ -1228,6 +1364,23 @@ impl InputBuffer {
         let col_view_count = batch
             .column_by_name(VIEW_COUNT_SEQ_COLUMN)
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        let col_web_conv_tracking_integration = batch
+            .column_by_name(WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN)
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let col_web_conv_time_on_site = [
+            (
+                WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ,
+                batch
+                    .column_by_name(WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN)
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+            ),
+            (
+                WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ,
+                batch
+                    .column_by_name(WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN)
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+            ),
+        ];
         let col_is_author_followed_by_viewer = batch
             .column_by_name(IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ_COLUMN)
             .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
@@ -1314,6 +1467,11 @@ impl InputBuffer {
             if let Some(tz) = col_timezone_id {
                 history_tz_enums[valid_entry_count] = tz.value(row_idx) as i16;
             }
+            if let Some(code) = col_web_conv_tracking_integration
+                && !code.is_null(row_idx)
+            {
+                history_web_conv_tracking_integration[valid_entry_count] = code.value(row_idx);
+            }
 
             stamp_engagement_counts(
                 &mut history_int64_features,
@@ -1325,6 +1483,15 @@ impl InputBuffer {
                 col_quote_count.map_or(0, |arr| arr.value(row_idx)) as u64,
                 col_view_count.map_or(0, |arr| arr.value(row_idx)) as u64,
             );
+            for (feature_idx, col) in col_web_conv_time_on_site {
+                if let Some(arr) = col
+                    && n_post_int64 > feature_idx
+                    && !arr.is_null(row_idx)
+                {
+                    history_int64_features[valid_entry_count * n_post_int64 + feature_idx] =
+                        arr.value(row_idx).max(0);
+                }
+            }
 
             history_is_author_followed[valid_entry_count] = col_is_author_followed_by_viewer
                 .is_some_and(|arr| !arr.is_null(row_idx) && arr.value(row_idx));
@@ -1360,6 +1527,12 @@ impl InputBuffer {
             &history_tz_enums,
             &mut history_categorical_features,
             n_post_cat,
+        );
+        stamp_i32_as_categorical(
+            &history_web_conv_tracking_integration,
+            &mut history_categorical_features,
+            n_post_cat,
+            WEB_CONV_TRACKING_INTEGRATION_SEQ,
         );
 
         let mut history_bool_features = vec![false; history_seq_len * n_post_bool];
@@ -1522,6 +1695,78 @@ impl InputBuffer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn conv_asset_ids_for_batch_predicate_and_keys() {
+        use arrow::array::{ArrayRef, BooleanArray, FixedSizeListArray, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let rows = [
+            (11, 21, 111_000, false),
+            (WEB_CONV_FAKE_TWEET_ID, 7, 1_000, false),
+            (555, 8, 2_000, true),
+            (WEB_CONV_FAKE_TWEET_ID, 7, 3_000, false),
+            (WEB_CONV_FAKE_TWEET_ID, 7, 4_000, false),
+        ];
+        let vocab = 256usize;
+        let conv_bit = pb::ActionName::AdsWebConversion as usize;
+        assert!(conv_bit < vocab);
+        let mut bits = vec![false; rows.len() * vocab];
+        for (i, r) in rows.iter().enumerate() {
+            bits[i * vocab + conv_bit] = r.3;
+        }
+        let multi_hot = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            vocab as i32,
+            Arc::new(BooleanArray::from(bits)),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tweetId", DataType::Int64, false),
+            Field::new("authorId", DataType::Int64, false),
+            Field::new("impressedTimeMs", DataType::Int64, false),
+            Field::new("actionNameMultiHot", multi_hot.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(multi_hot),
+            ],
+        )
+        .unwrap();
+
+        let ids = pb::ConvAssetIds {
+            impressed_time_ms: vec![111_000, 1_000, 2_000, 4_000],
+            author_id: vec![21, 7, 8, 7],
+            asset_id: vec![99, 42, 9, 0],
+        };
+        let map = conv_asset_map(Some(&ids));
+        assert_eq!(map.len(), 3, "asset_id 0 windows are dropped from the map");
+        assert_eq!(conv_asset_ids_for_batch(&batch, &map), vec![0, 42, 9, 0, 0]);
+
+        let ragged = pb::ConvAssetIds {
+            impressed_time_ms: vec![1_000],
+            author_id: vec![7, 8],
+            asset_id: vec![42],
+        };
+        assert!(conv_asset_map(Some(&ragged)).is_empty());
+        assert!(conv_asset_map(None).is_empty());
+        assert_eq!(
+            conv_asset_ids_for_batch(&batch, &HashMap::new()),
+            vec![0; 5]
+        );
+    }
     use super::*;
     use crate::feature_config::categorical_feature::{
         PRODUCT_SURFACE_SEQ, PRODUCT_SURFACE_SEQ_COLUMN, PRODUCT_SURFACE_SEQ_NAME,
@@ -1550,7 +1795,6 @@ mod tests {
                 ip_modulus: 1_073_741_789,
                 output_vocab_size: 64,
                 num_continuous_actions: 2,
-                search_query_embedding_dim: 0,
                 num_user_categorical_features: 0,
                 num_user_bool_features: 0,
                 num_user_float_features: 0,
@@ -1675,6 +1919,47 @@ mod tests {
     }
 
     #[test]
+    fn search_lexical_match_stamped_with_unset_as_zero() {
+        let n_post_cat = EXACT_PHRASE_CATEGORICAL_IDX + 1;
+        let n_post_float = MATCHED_WORD_FRACTION_SEQ + 1;
+        let mut model_config = test_model_config(n_post_cat);
+        model_config.hash_table.num_post_float_features = n_post_float;
+
+        let lexical = |fraction: f32, exact: bool| pb::SearchLexicalMatch {
+            matched_word_fraction: fraction,
+            exact_phrase: exact,
+        };
+        let candidate_set = pb::CandidateSet {
+            candidates: vec![
+                pb::TweetInfo {
+                    tweet_id: 1,
+                    search_lexical_match: Some(lexical(0.5, false)),
+                    ..Default::default()
+                },
+                pb::TweetInfo {
+                    tweet_id: 2,
+                    search_lexical_match: Some(lexical(1.0, true)),
+                    ..Default::default()
+                },
+                pb::TweetInfo {
+                    tweet_id: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+
+        let exact_phrase =
+            |j: usize| cand.categorical_features[j * n_post_cat + EXACT_PHRASE_CATEGORICAL_IDX];
+        let fraction = |j: usize| cand.float_features[j * n_post_float + MATCHED_WORD_FRACTION_SEQ];
+        assert_eq!((1, 0.5), (exact_phrase(0), fraction(0)));
+        assert_eq!((2, 1.0), (exact_phrase(1), fraction(1)));
+        assert_eq!((0, 0.0), (exact_phrase(2), fraction(2)));
+    }
+
+    #[test]
     fn author_is_nsfw_noop_when_feature_idx_out_of_range() {
         let n_post_cat = 1;
         let model_config = test_model_config(n_post_cat);
@@ -1727,6 +2012,40 @@ mod tests {
                 "padding product_surfaces[{j}] should be zero"
             );
         }
+    }
+
+    #[test]
+    fn search_query_stays_one_vector() {
+        let mut model_config = test_model_config(1);
+        model_config.search_query_embedding_dim = 4;
+        let query = vec![1.0f32, 2.0, 3.0, 4.0];
+        let candidate_set = pb::CandidateSet {
+            search_query_embedding: query.clone(),
+            candidates: vec![
+                pb::TweetInfo {
+                    tweet_id: 1000,
+                    author_id: 2000,
+                    ..Default::default()
+                },
+                pb::TweetInfo {
+                    tweet_id: 1001,
+                    author_id: 2001,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+        assert_eq!(cand.search_query_embeddings, query);
+        assert_eq!(cand.search_query_embeddings.len(), 4);
+    }
+
+    #[test]
+    fn repeat_query_into_writes_prefix_and_keeps_tail() {
+        let query = [1.0f32, 2.0];
+        let mut dest = vec![9.0f32; 8];
+        repeat_query_into(&mut dest, &query, 2);
+        assert_eq!(dest, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0, 9.0, 9.0]);
     }
 
     fn test_user_action_sequence(actions: &[(u64, u64)]) -> pb::UserActionSequence {
@@ -1918,6 +2237,126 @@ mod tests {
             buf.history_semantic_ids,
             vec![1, 8, 0, 4, 5, 6, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn columnar_history_web_conv_columns_fill_their_feature_slots() {
+        use arrow::array::{Int32Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let to_bytes = |batch: &RecordBatch| {
+            let mut bytes = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(batch).unwrap();
+            writer.finish().unwrap();
+            bytes
+        };
+        let with_columns = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+                Field::new(
+                    WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN,
+                    DataType::Int64,
+                    true,
+                ),
+                Field::new(
+                    WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN,
+                    DataType::Int64,
+                    true,
+                ),
+                Field::new(
+                    WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN,
+                    DataType::Int32,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![11i64, 12])),
+                Arc::new(Int64Array::from(vec![21i64, 22])),
+                Arc::new(Int64Array::from(vec![Some(125_400i64), Some(0)])),
+                Arc::new(Int64Array::from(vec![Some(61_999i64), None])),
+                Arc::new(Int32Array::from(vec![Some(5i32), None])),
+            ],
+        )
+        .unwrap();
+        let without_columns = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![11i64, 12])),
+                Arc::new(Int64Array::from(vec![21i64, 22])),
+            ],
+        )
+        .unwrap();
+
+        let mut model_config = test_history_model_config();
+        model_config.hash_table.num_post_int64_features = WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ + 1;
+        model_config.hash_table.num_post_categorical_features =
+            WEB_CONV_TRACKING_INTEGRATION_SEQ + 1;
+        let n = model_config.hash_table.num_post_int64_features;
+        let n_cat = model_config.hash_table.num_post_categorical_features;
+        let history_slot =
+            |buf: &InputBuffer, row: usize, idx: usize| buf.history_int64_features[row * n + idx];
+        let history_cat = |buf: &InputBuffer, row: usize| {
+            buf.history_categorical_features[row * n_cat + WEB_CONV_TRACKING_INTEGRATION_SEQ]
+        };
+
+        let buf = InputBuffer::compute_from_columnar_bytes(
+            &model_config,
+            &to_bytes(&with_columns),
+            &pb::CandidateSet::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            125_400,
+            history_slot(&buf, 0, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ)
+        );
+        assert_eq!(
+            61_999,
+            history_slot(&buf, 0, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ)
+        );
+        assert_eq!(
+            0,
+            history_slot(&buf, 1, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ)
+        );
+        assert_eq!(
+            0,
+            history_slot(&buf, 1, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ)
+        );
+        assert_eq!(5, history_cat(&buf, 0));
+        assert_eq!(0, history_cat(&buf, 1));
+
+        let buf = InputBuffer::compute_from_columnar_bytes(
+            &model_config,
+            &to_bytes(&without_columns),
+            &pb::CandidateSet::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        for row in 0..2 {
+            assert_eq!(
+                0,
+                history_slot(&buf, row, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ)
+            );
+            assert_eq!(
+                0,
+                history_slot(&buf, row, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ)
+            );
+            assert_eq!(0, history_cat(&buf, row));
+        }
     }
 
     #[test]
@@ -2153,5 +2592,21 @@ mod tests {
         assert_eq!(1, cand.int64_features[base1 + FAV_COUNT_SEQ]);
         assert_eq!(5, cand.int64_features[base1 + VIEW_COUNT_SEQ]);
         assert!(!cand.bool_features[n_post_bool + IS_STALE_POST14D]);
+    }
+
+    #[test]
+    fn user_gender_is_raw_proto_enum() {
+        let mut cfg = test_model_config(0).hash_table;
+        cfg.num_user_categorical_features = 7;
+        cfg.num_user_float_features = 4;
+        let gender_idx = crate::feature_config::user_categorical_feature::USER_GENDER;
+        for g in [pb::Gender::Male, pb::Gender::Female, pb::Gender::Unknown] {
+            let ctx = pb::UserContext {
+                user_gender: g as i32,
+                ..Default::default()
+            };
+            let f = InputBuffer::extract_user_features(&cfg, None, Some(&ctx));
+            assert_eq!(f.categorical_features[gender_idx], g as i16, "{g:?}");
+        }
     }
 }

@@ -1,4 +1,4 @@
-# mirrored from GrowthBook dynamic config; last sync 2026-08-06T16:20:00Z
+# mirrored from GrowthBook dynamic config; last sync 2026-08-25T16:15:48Z
 
 for_entity: post
 
@@ -41,21 +41,21 @@ rules:
     then:
       kind: act_add_post_labels_v2
       labels: ["RiskyHighVizReply"]
-      ttl_msec: 2592000000   
+      ttl_msec: 2592000000
 
   - id: act_add_gibberish_post_label
     when: '"gibberish_post" in score.labels'
     then:
       kind: act_add_post_labels_v2
       labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000   
+      ttl_msec: 2592000000
 
   - id: act_add_fast_reply_spam_post_label
     when: '"fast_reply_spam_post" in score.labels'
     then:
       kind: act_add_post_labels_v2
       labels: ["SpamHighRecall"]
-      ttl_msec: 2592000000   
+      ttl_msec: 2592000000
 
   - id: anchor_campaign_post
     when: '"anchor_campaign_post" in score.labels'
@@ -74,6 +74,11 @@ rules:
       kind: act_suspend_user
       perm: true
       policy: Cse
+
+  - id: act_requested_actions
+    when: "size(score.requested_actions) > 0"
+    then:
+      kind: act_requested_actions
 
   - id: post_no_actionable_label
     when: "true"

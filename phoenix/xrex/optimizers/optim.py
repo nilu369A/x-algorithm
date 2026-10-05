@@ -11,7 +11,6 @@ import optax
 
 from xai_configlib import Config, configclass
 from xrex.models.model_utils import Parameter
-
 from xrex.optimizers.schedule import BaseSchedule
 
 

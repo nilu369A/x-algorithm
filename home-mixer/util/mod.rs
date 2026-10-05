@@ -1,14 +1,16 @@
-pub mod author_rules;
 pub mod candidates_util;
 pub mod conversation_grouping;
 pub mod country_codes;
 pub mod egress;
 pub mod feed_log;
 pub mod phoenix_request;
+pub mod popular_authors;
 pub mod rescore;
 pub mod shadow;
+pub mod strato_context;
 pub mod string_case;
 pub mod tweet_type_metrics;
 pub mod url;
 pub mod urt;
+pub mod viewer_history;
 pub mod xds;

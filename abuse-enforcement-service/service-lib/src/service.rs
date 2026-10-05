@@ -110,6 +110,8 @@ pub struct AppState {
     pub growthbook_environment: String,
         pub kafka_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
                 pub kafka_producers: crate::KafkaProducers,
+                pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
+                pub boot_config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -1412,11 +1414,11 @@ pub async fn handle_rules_get(State(state): State<Arc<AppState>>) -> impl IntoRe
     let cache = &state.rules_cache;
     let user = cache.status(
         EntityType::User,
-        dc.enforcement_rules_yaml(EntityType::User).as_deref(),
+        dc.enforcement_rules_yaml(EntityType::User).as_ref(),
     );
     let post = cache.status(
         EntityType::Post,
-        dc.enforcement_rules_yaml(EntityType::Post).as_deref(),
+        dc.enforcement_rules_yaml(EntityType::Post).as_ref(),
     );
     (StatusCode::OK, Json(json!({ "user": user, "post": post })))
 }
@@ -2075,9 +2077,9 @@ mod tests {
     #[test]
     fn truncate_utf8_does_not_split_multibyte_chars() {
         let prefix = "a".repeat(999);
-        let s = format!("{prefix}ـrest"); 
+        let s = format!("{prefix}ـrest");
         assert!(s.is_char_boundary(999));
-        assert!(!s.is_char_boundary(1000)); 
+        assert!(!s.is_char_boundary(1000));
         let out = truncate_utf8(&s, 1000);
         assert!(out.ends_with("..."));
         assert_eq!(out, format!("{prefix}..."));
@@ -2099,6 +2101,64 @@ mod tests {
     const POLICY_IN_VIOLATION: &str = "PlatformManipulation";
     const SPAM_HIGH_RECALL_LABEL: &str = "SpamHighRecall";
     const LABEL_EXPIRY_MSEC: i64 = 30 * 24 * 60 * 60 * 1000;
+
+                                #[test]
+    fn every_action_shape_encodes_against_the_ais_schema() {
+        use xai_abuse_thrift_codec::{SCHEMA_AIS, Transcoder};
+
+        let transcoder = Transcoder::from_schema_bytes(SCHEMA_AIS).expect("AIS schema loads");
+        let method = transcoder
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction in schema");
+
+        let actions = [
+            EnforcementAction::suspend_user(1, false, POLICY_IN_VIOLATION, vec!["n".to_owned()]),
+            EnforcementAction::suspend_user(1, true, POLICY_IN_VIOLATION, vec![]),
+            EnforcementAction::add_user_label(
+                1,
+                vec![SPAM_HIGH_RECALL_LABEL.to_owned()],
+                Some(LABEL_EXPIRY_MSEC),
+                vec!["n".to_owned()],
+            ),
+            EnforcementAction::add_user_label(
+                1,
+                vec![SPAM_HIGH_RECALL_LABEL.to_owned()],
+                None,
+                vec![],
+            ),
+            EnforcementAction::add_post_label(
+                2,
+                vec![SPAM_HIGH_RECALL_LABEL.to_owned()],
+                Some(LABEL_EXPIRY_MSEC),
+                vec![],
+            ),
+            EnforcementAction::bounce_arkose(1, vec!["n".to_owned()]),
+            EnforcementAction::bounce_captcha(1, vec![]),
+            EnforcementAction::spam_liveness_check(1, vec![]),
+        ];
+
+        for action in actions {
+            let request = crate::ais_client::build_intake_request(
+                action.actor_header(),
+                action.to_json(),
+                AIS_TOOL,
+                Some(action.audit_note()),
+            );
+            transcoder
+                .encode_call(
+                    method.thrift_method_name,
+                    method.arg_field_name,
+                    method.arg_field_id,
+                    method.request_type,
+                    &request,
+                    0,
+                )
+                .unwrap_or_else(|e| panic!("{} must encode: {e}", action.name()));
+        }
+    }
 
     #[test]
     fn ais_outcome_failure_is_detected_as_permanent() {
@@ -2380,7 +2440,7 @@ mod tests {
             vec!["model_version: v51".to_owned()],
         );
         assert_eq!(action.name(), "addPostLabelsV2");
-        assert_eq!(action.entity_id(), 777); 
+        assert_eq!(action.entity_id(), 777);
         let v = action.to_json();
         let inner = v.get("addLabelsV2").expect("addLabelsV2 key");
 

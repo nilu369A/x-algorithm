@@ -260,6 +260,42 @@ def build1FavTopicIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRe
   buildTopicIndexWithTopics(candidate, stats, 5, postBased50PctTopics)
 }
 
+def build1FavVideoIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
+  candidate.tweetMedadata match {
+    case Some(tweet) if eventProcessing.hasValidImmersiveVideo(tweet) =>
+      val object = {
+        postId = candidate.postId,
+        authorId = candidate.authorId,
+        indexName = "1fav_video"
+      }
+      #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
+      stats.counter("1fav_video_indexing_event_created").incr(1)
+    case _ => ()
+  }
+}
+
+def build1FavReplyIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
+  val object = {
+    postId = candidate.postId,
+    authorId = candidate.authorId,
+    indexName = "1fav_reply"
+  }
+  #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
+  stats.counter("1fav_reply_indexing_event_created").incr(1)
+}
+
+def build32FavReplyIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
+  if (eventProcessing.hasMinFavoriteCount(candidate.engagementCount, 32L)) {
+    val object = {
+      postId = candidate.postId,
+      authorId = candidate.authorId,
+      indexName = "32fav_reply"
+    }
+    #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
+    stats.counter("32fav_reply_indexing_event_created").incr(1)
+  }
+}
+
 def buildPostCreationIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
   val object = {
     postId = candidate.postId,
@@ -376,6 +412,8 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
   val numRequestsReceived = receiverStats.counter("num_requests_received")
   val numSkippedCommunity = receiverStats.counter("num_skipped_community")
   val numSkippedReplies = receiverStats.counter("num_skipped_replies")
+  val numSkippedSelfReplies = receiverStats.counter("num_skipped_self_replies")
+  val numSkippedFilteredReplies = receiverStats.counter("num_skipped_filtered_replies")
   val numSkippedReposts = receiverStats.counter("num_skipped_reposts")
   val numSkippedPosts = receiverStats.counter("num_skipped_filtered_posts")
   val numCandidatesProcessed = receiverStats.counter("num_candidates_processed")
@@ -433,6 +471,16 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
               numSkippedCommunity.incr(1)
             } else if (isReply) {
               numSkippedReplies.incr(1)
+              if (eventSource == Fav) {
+                if (eventProcessing.isSelfReply(post)) {
+                  numSkippedSelfReplies.incr(1)
+                } else if (shouldDropPost) {
+                  numSkippedFilteredReplies.incr(1)
+                } else {
+                  build1FavReplyIndex(candidate, receiverStats)
+                  build32FavReplyIndex(candidate, receiverStats)
+                }
+              }
             } else if (isRepost) {
               numSkippedReposts.incr(1)
             } else if (shouldDropPost) {
@@ -452,6 +500,7 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
                   build32FavIndex(candidate, receiverStats)
                   if(hasImmersiveVideo) {
                     buildVideoIndex(candidate, receiverStats)
+                    build1FavVideoIndex(candidate, receiverStats)
                     buildImagineIndex(candidate, receiverStats)
                   }
                   buildMetadataDump(candidate, receiverStats)

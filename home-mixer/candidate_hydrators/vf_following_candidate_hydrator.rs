@@ -1,4 +1,4 @@
-use crate::candidate_hydrators::vf_candidate_hydrator::should_drop_ancillary;
+use crate::candidate_hydrators::vf_candidate_hydrator::{should_drop_ancillary, visibility_fields};
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableXaiVfClient;
@@ -8,9 +8,8 @@ use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::hydrator::Hydrator;
 use xai_twittercontext_proto::GetTwitterContextViewer;
-use xai_visibility_filtering::models::FilteredReason;
 use xai_visibility_filtering::vf_client::SafetyLevel::TimelineHome;
-use xai_visibility_filtering::vf_client::VfClient;
+use xai_visibility_filtering::vf_client::{TweetVisibility, VfClient};
 
 pub struct VFFollowingCandidateHydrator {
     pub strato_vf_client: Arc<dyn VfClient + Send + Sync>,
@@ -57,7 +56,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
         post_ids.sort_unstable();
         post_ids.dedup();
 
-        let all_results: HashMap<u64, Result<Option<FilteredReason>>> = if post_ids.is_empty() {
+        let all_results: HashMap<u64, Result<TweetVisibility>> = if post_ids.is_empty() {
             HashMap::new()
         } else {
             client
@@ -68,16 +67,14 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let primary_result = all_results.get(&candidate.tweet_id);
-            let visibility_reason = match primary_result {
-                Some(Ok(Some(reason))) => Some(reason.clone()),
-                _ => None,
-            };
+            let (visibility_action, visibility_reason) = visibility_fields(primary_result);
 
             let drop_ancillary = should_drop_ancillary(candidate, &all_results);
 
             let hydrated = match primary_result {
                 Some(Err(err)) => Err(err.to_string()),
                 _ => Ok(PostCandidate {
+                    visibility_action,
                     visibility_reason,
                     drop_ancillary_posts: Some(drop_ancillary),
                     ..Default::default()
@@ -89,6 +86,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator 
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
+        candidate.visibility_action = hydrated.visibility_action;
         candidate.visibility_reason = hydrated.visibility_reason;
         candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;
     }

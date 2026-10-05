@@ -1,7 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::ValueModelMode;
-use crate::scorers::ranking_scorer::ScoringWeights;
+use crate::scorers::value_model;
 use prost::Message;
 use rand::random;
 use std::collections::HashMap;
@@ -13,6 +12,8 @@ use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_home_mixer_proto as pb;
 
 const TOP_K: usize = 50;
+
+const WEIGHTED_VALUE_MODEL_MODE: &str = "weighted";
 
 pub struct RerankingKafkaSideEffect {
     kafka_client: Arc<dyn KafkaPublisherClient>,
@@ -84,8 +85,8 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for RerankingKafkaSideEffect {
             total_candidates_count: Some(total_count),
             request_join_id: Some(input.query.request_id),
             product_surface: product_surface.into(),
-            applied_weights: ScoringWeights::from_params(&input.query.params).applied_weights_map(),
-            value_model_mode: Some(input.query.params.get(ValueModelMode)),
+            applied_weights: value_model::applied_weights(&input.query),
+            value_model_mode: Some(WEIGHTED_VALUE_MODEL_MODE.to_string()),
         };
 
         let bytes = batch.encode_to_vec();
@@ -191,7 +192,7 @@ mod tests {
     };
 
     fn default_weights_map() -> HashMap<String, f64> {
-        ScoringWeights::from_params(&xai_feature_switches::Params::default()).applied_weights_map()
+        value_model::applied_weights(&ScoredPostsQuery::default())
     }
 
     #[test]

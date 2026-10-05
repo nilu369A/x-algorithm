@@ -16,6 +16,8 @@ from grok_sampler.config import EapiModelConfig
 
 logger = logging.getLogger(__name__)
 
+MAX_SEARCH_DOMAINS = 5
+
 
 def get_loop_id() -> int:
     return id(get_running_loop())
@@ -60,6 +62,7 @@ class EapiSampler:
         self.api_host = eapi_config.api_host
         self.log_reasoning_trace: bool = eapi_config.log_reasoning_trace
         self.enable_search: bool = eapi_config.enable_search
+        self.open_search: bool = eapi_config.open_search
         self.reasoning_effort: str | None = eapi_config.reasoning_effort
 
         api_key = self.api_key or os.getenv("XAI_API_KEY")
@@ -142,8 +145,12 @@ class EapiSampler:
                 create_kwargs["reasoning_effort"] = self.reasoning_effort
             if self.enable_search and search_allowed_domains:
                 create_kwargs["tools"] = [
-                    web_search(allowed_domains=search_allowed_domains)
+                    web_search(
+                        allowed_domains=search_allowed_domains[:MAX_SEARCH_DOMAINS]
+                    )
                 ]
+            elif self.enable_search and self.open_search:
+                create_kwargs["tools"] = [web_search()]
             chat = client.chat.create(**create_kwargs)
             response = await chat.sample()
             Metrics.counter("llm.sample.success.count").add(1, attributes=attributes)

@@ -14,6 +14,7 @@ pub mod copy_manifest;
 pub mod copy_port_client;
 pub mod emb_table;
 pub mod grpc_compression;
+pub mod grpc_server_latency;
 pub mod grpc_util;
 pub mod host_buffer;
 #[cfg(target_os = "linux")]
@@ -23,7 +24,6 @@ pub mod multimodal_retrieval;
 pub mod proto_parser;
 pub mod request_metrics;
 pub mod request_queue;
-pub mod sid_client;
 pub mod storage_util;
 pub mod tls;
 pub mod util;

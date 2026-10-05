@@ -6,8 +6,8 @@ import jax
 import jax.numpy as jnp
 import optax
 from optax import contrib as optax_contrib
-from optax._src import numerics as _optax_numerics
 
+from optax._src import numerics as _optax_numerics
 from optax.contrib._muon import _DEFAULT_NS_COEFFS, orthogonalize_via_newton_schulz
 
 from xrex.models.model_utils import Parameter

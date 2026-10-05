@@ -1,14 +1,73 @@
-use crate::models::candidate::{CandidateHelpers, PostCandidate};
+use crate::models::candidate::{CandidateHelpers, PostCandidate, RetrievalSource};
 use crate::models::query::ScoredPostsQuery;
-use rustc_hash::FxHashSet;
+use crate::params::{PhoenixExperimentOverrides, RerankerHeadTag};
+use rustc_hash::{FxHashMap, FxHashSet};
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::TOP_LOG_PROBS_NUM;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 use xai_geo_ip::zip_to_dma_code;
+use xai_home_mixer_proto as pb;
 use xai_recsys_proto::{
     country_code_string_to_enum, CandidateSet, ClientContext, DeviceFeature,
-    PredictNextActionsRequest, ProductSurface, UserContext,
+    PredictNextActionsRequest, ProductSurface, RetrieveTopKCandidatesResponse, TweetInfo,
+    UserContext,
 };
 
 const PHOENIX_CLIENT_MAX_CANDIDATES: usize = 2800;
+
+pub fn candidates_from_retrieval_response(
+    response: RetrieveTopKCandidatesResponse,
+    served_type_for_dataset: impl Fn(u32) -> pb::ServedType,
+    cluster: PhoenixRetrievalCluster,
+) -> Vec<PostCandidate> {
+    let scored: Vec<(TweetInfo, f32, pb::ServedType)> = response
+        .top_k_candidates
+        .into_iter()
+        .flat_map(|scored_candidates| scored_candidates.candidates)
+        .filter_map(|scored_candidate| {
+            let served_type = served_type_for_dataset(scored_candidate.dataset_type);
+            scored_candidate
+                .candidate
+                .map(|tweet_info| (tweet_info, scored_candidate.score, served_type))
+        })
+        .collect();
+    let positions = positions_within_served_type(&scored);
+
+    scored
+        .into_iter()
+        .zip(positions)
+        .map(
+            |((tweet_info, score, served_type), position)| PostCandidate {
+                tweet_id: tweet_info.tweet_id,
+                author_id: tweet_info.author_id,
+                in_reply_to_tweet_id: (tweet_info.in_reply_to_tweet_id != 0)
+                    .then_some(tweet_info.in_reply_to_tweet_id),
+                retweeted_tweet_id: (tweet_info.retweeted_tweet_id != 0)
+                    .then_some(tweet_info.retweeted_tweet_id),
+                retrieval_sources: vec![RetrievalSource {
+                    served_type,
+                    cluster: Some(cluster),
+                    score: Some(score),
+                    position: Some(position),
+                }],
+                served_type: Some(served_type),
+                ..Default::default()
+            },
+        )
+        .collect()
+}
+
+fn positions_within_served_type(scored: &[(TweetInfo, f32, pb::ServedType)]) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..scored.len()).collect();
+    order.sort_by(|&a, &b| scored[b].1.total_cmp(&scored[a].1));
+    let mut next = FxHashMap::default();
+    let mut positions = vec![0; scored.len()];
+    for idx in order {
+        let position = next.entry(scored[idx].2).or_insert(0);
+        *position += 1;
+        positions[idx] = *position;
+    }
+    positions
+}
 
 pub fn build_client_context(query: &ScoredPostsQuery) -> Option<ClientContext> {
     if query.user_id == 0 {
@@ -131,11 +190,25 @@ pub fn build_request_without_sequence_and_candidates(
         candidate_sets: vec![candidate_set],
         return_logprob: true,
         top_logprobs_num: TOP_LOG_PROBS_NUM,
+        return_backbone_scores: query.return_backbone_scores,
         client_context: build_client_context(query),
         user_context: build_user_context(query),
         metadata: query.request_id.to_string(),
+        experiment_overrides: parse_experiment_overrides(
+            &query.params.get(PhoenixExperimentOverrides),
+        ),
         ..Default::default()
     }
+}
+
+pub fn parse_experiment_overrides(spec: &str) -> std::collections::HashMap<String, String> {
+    spec.split(';')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            let (k, v) = (k.trim(), v.trim());
+            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 pub fn build_prediction_request(
@@ -145,7 +218,9 @@ pub fn build_prediction_request(
 ) -> PredictNextActionsRequest {
     let mut request = build_request_without_sequence_and_candidates(query, product_surface);
     request.candidate_sets[0].candidates = build_tweet_infos(query, candidates);
-    request.sequences = vec![query.scoring_sequence.clone().unwrap_or_default()];
+    let mut sequence = query.scoring_sequence.clone().unwrap_or_default();
+    sequence.reranker_head_tag = Some(query.params.get(RerankerHeadTag) as u32);
+    request.sequences = vec![sequence];
     request.columnar_sequences = query.columnar_scoring_sequence.iter().cloned().collect();
     request
 }

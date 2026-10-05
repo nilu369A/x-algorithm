@@ -1,29 +1,56 @@
+use crate::caller_identity::{self, Endpoint};
 use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
-use crate::models::{RawCandidate, TweetId, VfAction};
-use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard};
+use crate::models::{ClientCapability, RawCandidate, TweetId};
+use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
-use std::time::Instant;
+use crate::treatment;
+use std::sync::Arc;
+use std::time::Duration;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
-use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
+pub(crate) type FinishComparison = Box<dyn FnOnce(&[FilterOutcome]) + Send>;
+
+pub(crate) trait Comparator: Send + Sync {
+    fn begin(
+        &self,
+        viewer_id: Option<u64>,
+        country_code: Option<String>,
+        safety_level: SafetyLevel,
+        tweet_ids: Vec<u64>,
+    ) -> Option<FinishComparison>;
+}
+
 pub struct FilterTweetsEndpoint {
-    filter_tweets: FilterTweets,
+    filter_tweets: Arc<FilterTweets>,
+    comparator: Option<Box<dyn Comparator>>,
 }
 
 impl FilterTweetsEndpoint {
-    pub(crate) fn new(filter_tweets: FilterTweets) -> Self {
-        Self { filter_tweets }
+    pub(crate) fn new(
+        filter_tweets: Arc<FilterTweets>,
+        comparator: Option<Box<dyn Comparator>>,
+    ) -> Self {
+        Self {
+            filter_tweets,
+            comparator,
+        }
     }
 
     pub async fn handle(
         &self,
         request: Request<vf_pb::VisibilityFilterRequest>,
     ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
+        let entered = tokio::time::Instant::now();
         let request_metrics = RequestMetricsGuard::new();
-        let start = Instant::now();
+        let grpc_timeout = parse_grpc_timeout(request.metadata());
+        let caller = caller_identity::record(Endpoint::FilterTweets, &request);
+        let context = crate::hydration::request_context(entered, grpc_timeout);
         let req = request.into_inner();
-        ft_metrics::record_batch_size(req.tweets.len());
+        ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());
+        let viewer_id = normalize_viewer_id(req.viewer_id);
+        ft_metrics::record_viewer_state(req.viewer_id, viewer_id);
 
         let safety_level = match req.safety_level() {
             vf_pb::SafetyLevel::FilterAll => SafetyLevel::FilterAll,
@@ -31,15 +58,10 @@ impl FilterTweetsEndpoint {
             vf_pb::SafetyLevel::TimelineHomeRecommendations => {
                 SafetyLevel::TimelineHomeRecommendations
             }
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations => {
+                SafetyLevel::ImmersiveExpandedRecommendations
+            }
         };
-        info!(
-            viewer_id = req.viewer_id,
-            tweet_count = req.tweets.len(),
-            country_code = ?req.country_code,
-            safety_level = ?safety_level,
-            "VF request"
-        );
-
         let candidates: Vec<RawCandidate> = req
             .tweets
             .iter()
@@ -49,48 +71,81 @@ impl FilterTweetsEndpoint {
             })
             .collect();
 
-        let response = self
-            .filter_tweets
-            .run(FilterRequest {
-                viewer_id: req.viewer_id,
+        let finish_comparison = self.comparator.as_ref().and_then(|comparator| {
+            comparator.begin(
+                viewer_id,
+                req.country_code.clone(),
+                safety_level,
+                req.tweets.iter().map(|t| t.tweet_id).collect(),
+            )
+        });
+
+        let response = context
+            .scope(self.filter_tweets.run(FilterRequest {
+                viewer_id,
                 country_code: req.country_code,
+                client_capability: ClientCapability::default(),
                 safety_level,
                 candidates,
-            })
+                rpc: Rpc::FilterTweets,
+            }))
             .await;
+        ft_metrics::record_verdicts(
+            Rpc::FilterTweets,
+            safety_level,
+            response.outcomes.iter().map(|outcome| &outcome.verdict),
+        );
+        ft_metrics::record_rested_on(
+            Rpc::FilterTweets,
+            safety_level,
+            response.outcomes.iter().map(|outcome| outcome.rested_on),
+        );
+
+        if let Some(finish_comparison) = finish_comparison {
+            finish_comparison(&response.outcomes);
+        }
+
         let results = response
             .outcomes
             .into_iter()
             .map(to_visibility_result)
             .collect();
 
-        info!(
-            tweet_count = response.summary.tweet_count,
-            drop_count = response.summary.drop_count,
-            not_found_count = response.summary.unresolved_author_count,
-            latency_ms = start.elapsed().as_millis(),
-            "VF response"
-        );
-
+        request_metrics.record_deadline(grpc_timeout);
         request_metrics.mark_success();
+        caller.mark_success();
         Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))
     }
 }
 
-fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult {
-    let (kind, filtered_reason) = match outcome.verdict.action {
-        VfAction::Allow => (vf_pb::action::Kind::Allow(true), None),
-        VfAction::Drop(reason) => (
-            vf_pb::action::Kind::Drop(vf_pb::DropReason {}),
-            Some(reason.into()),
-        ),
-        VfAction::Interstitial(reason) => {
-            (vf_pb::action::Kind::Interstitial(true), Some(reason.into()))
-        }
+pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
+    raw.filter(|&id| id.cast_signed() > 0)
+}
+
+pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
+    let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    let nanos_per_unit = match unit {
+        "H" => 3_600_000_000_000,
+        "M" => 60_000_000_000,
+        "S" => 1_000_000_000,
+        "m" => 1_000_000,
+        "u" => 1_000,
+        "n" => 1,
+        _ => return None,
     };
+    Some(Duration::from_nanos(value.checked_mul(nanos_per_unit)?))
+}
+
+fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult {
+    let (action, filtered_reason) = treatment::proto_action(outcome.verdict);
     vf_pb::TweetVisibilityResult {
         tweet_id: outcome.tweet_id.0,
-        action: Some(vf_pb::Action { kind: Some(kind) }),
+        action: Some(action),
         filtered_reason,
         safety_labels: outcome.safety_labels,
     }
@@ -99,66 +154,162 @@ fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::Verdict;
-    use xai_visibility_filtering::models::FilteredReason;
+    use crate::hydration::plan::Source;
+    use crate::hydration::sources::InMemorySources;
+    use crate::rules::RuleEngine;
+    use std::sync::Mutex;
 
-    fn outcome(tweet_id: u64, action: VfAction) -> FilterOutcome {
-        FilterOutcome {
-            tweet_id: TweetId(tweet_id),
-            verdict: Verdict {
-                action,
-                decided_by: Some("test"),
-            },
-            safety_labels: None,
+    async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
+        let sources = Arc::new(InMemorySources::default());
+        let endpoint = FilterTweetsEndpoint::new(
+            Arc::new(FilterTweets::new(
+                Arc::<InMemorySources>::clone(&sources),
+                RuleEngine::for_tests(),
+            )),
+            None,
+        );
+        let response = endpoint
+            .handle(Request::new(vf_pb::VisibilityFilterRequest {
+                safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
+                tweets: vec![vf_pb::TweetInput {
+                    tweet_id: 2,
+                    author_id: Some(20),
+                }],
+                viewer_id,
+                country_code: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response.into_inner().results.len(), 1);
+        sources
+            .calls()
+            .into_iter()
+            .filter(|source| matches!(source, Source::GizmoduckViewer | Source::GizmoduckAuthor))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn endpoint_treats_zero_viewer_id_as_logged_out() {
+        let logged_out = gizmoduck_calls(None).await;
+        assert_eq!(gizmoduck_calls(Some(0)).await, logged_out);
+        assert_eq!(gizmoduck_calls(Some(u64::MAX)).await, logged_out);
+        assert_eq!(gizmoduck_calls(Some(42)).await, logged_out + 1);
+    }
+
+    #[derive(Default)]
+    struct ViewerIds(Arc<Mutex<Vec<Option<u64>>>>);
+
+    impl Comparator for ViewerIds {
+        fn begin(
+            &self,
+            viewer_id: Option<u64>,
+            _country_code: Option<String>,
+            _safety_level: SafetyLevel,
+            _tweet_ids: Vec<u64>,
+        ) -> Option<FinishComparison> {
+            self.0.lock().unwrap().push(viewer_id);
+            None
         }
     }
 
-    #[test]
-    fn allow_maps_to_proto_result() {
-        let result = to_visibility_result(outcome(7, VfAction::Allow));
+    #[tokio::test]
+    async fn comparator_sees_the_normalized_viewer_id() {
+        let viewer_ids = ViewerIds::default();
+        let seen = Arc::clone(&viewer_ids.0);
+        let endpoint = FilterTweetsEndpoint::new(
+            Arc::new(FilterTweets::new(
+                Arc::new(InMemorySources::default()),
+                RuleEngine::for_tests(),
+            )),
+            Some(Box::new(viewer_ids)),
+        );
+        for viewer_id in [Some(0), Some(42)] {
+            endpoint
+                .handle(Request::new(vf_pb::VisibilityFilterRequest {
+                    safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
+                    tweets: vec![vf_pb::TweetInput {
+                        tweet_id: 2,
+                        author_id: Some(20),
+                    }],
+                    viewer_id,
+                    country_code: None,
+                }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![None, Some(42)]);
+    }
 
-        assert_eq!(result.tweet_id, 7);
-        assert!(matches!(
-            result.action.unwrap().kind,
-            Some(vf_pb::action::Kind::Allow(true))
-        ));
-        assert!(result.filtered_reason.is_none());
+    #[derive(Default)]
+    struct FinishedResults(Arc<Mutex<Vec<Vec<vf_pb::TweetVisibilityResult>>>>);
+
+    impl Comparator for FinishedResults {
+        fn begin(
+            &self,
+            _viewer_id: Option<u64>,
+            _country_code: Option<String>,
+            _safety_level: SafetyLevel,
+            _tweet_ids: Vec<u64>,
+        ) -> Option<FinishComparison> {
+            let finished = Arc::clone(&self.0);
+            Some(Box::new(move |outcomes: &[FilterOutcome]| {
+                finished
+                    .lock()
+                    .unwrap()
+                    .push(outcomes.iter().cloned().map(to_visibility_result).collect());
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn comparator_finishes_with_the_served_outcomes() {
+        let comparator = FinishedResults::default();
+        let finished = Arc::clone(&comparator.0);
+        let endpoint = FilterTweetsEndpoint::new(
+            Arc::new(FilterTweets::new(
+                Arc::new(InMemorySources::default()),
+                RuleEngine::for_tests(),
+            )),
+            Some(Box::new(comparator)),
+        );
+        let served = endpoint
+            .handle(Request::new(vf_pb::VisibilityFilterRequest {
+                safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
+                tweets: [(2, 20), (3, 30)]
+                    .map(|(tweet_id, author_id)| vf_pb::TweetInput {
+                        tweet_id,
+                        author_id: Some(author_id),
+                    })
+                    .into(),
+                viewer_id: Some(42),
+                country_code: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .results;
+        assert_eq!(*finished.lock().unwrap(), vec![served]);
     }
 
     #[test]
-    fn drop_maps_to_proto_result_with_labels() {
-        let labels = vf_pb::SafetyLabelMap::default();
-        let mut drop = outcome(8, VfAction::Drop(FilteredReason::ContainNsfwMedia));
-        drop.safety_labels = Some(labels.clone());
-        let result = to_visibility_result(drop);
-
-        assert_eq!(result.tweet_id, 8);
-        assert!(matches!(
-            result.action.unwrap().kind,
-            Some(vf_pb::action::Kind::Drop(_))
-        ));
-        assert!(matches!(
-            result.filtered_reason.unwrap().reason,
-            Some(vf_pb::filtered_reason::Reason::ContainNsfwMedia(true))
-        ));
-        assert_eq!(result.safety_labels, Some(labels));
-    }
-
-    #[test]
-    fn interstitial_maps_to_proto_result() {
-        let result = to_visibility_result(outcome(
-            9,
-            VfAction::Interstitial(FilteredReason::ContainNsfwMedia),
-        ));
-
-        assert_eq!(result.tweet_id, 9);
-        assert!(matches!(
-            result.action.unwrap().kind,
-            Some(vf_pb::action::Kind::Interstitial(true))
-        ));
-        assert!(matches!(
-            result.filtered_reason.unwrap().reason,
-            Some(vf_pb::filtered_reason::Reason::ContainNsfwMedia(true))
-        ));
+    fn parse_grpc_timeout_units_and_garbage() {
+        let parsed = |value: &str| {
+            let mut metadata = MetadataMap::new();
+            metadata.insert("grpc-timeout", value.parse().unwrap());
+            parse_grpc_timeout(&metadata)
+        };
+        assert_eq!(parsed("400m"), Some(Duration::from_millis(400)));
+        assert_eq!(parsed("1S"), Some(Duration::from_secs(1)));
+        assert_eq!(parsed("2M"), Some(Duration::from_secs(120)));
+        assert_eq!(parsed("500u"), Some(Duration::from_micros(500)));
+        assert_eq!(parsed("3H"), Some(Duration::from_secs(10_800)));
+        assert_eq!(parsed("9n"), Some(Duration::from_nanos(9)));
+        assert_eq!(parsed("400"), None);
+        assert_eq!(parsed("m"), None);
+        assert_eq!(parsed("400x"), None);
+        assert_eq!(parsed("+400m"), None);
+        assert_eq!(parsed("12345678m"), Some(Duration::from_millis(12_345_678)));
+        assert_eq!(parsed("123456789m"), None);
+        assert_eq!(parse_grpc_timeout(&MetadataMap::new()), None);
     }
 }

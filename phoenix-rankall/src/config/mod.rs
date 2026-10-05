@@ -23,6 +23,23 @@ pub struct Cli {
     )]
     pub bootstrap: String,
 
+    #[arg(long, value_enum, default_value_t = KafkaAuthMode::Scram, env = "KAFKA_AUTH")]
+    pub kafka_auth: KafkaAuthMode,
+
+    #[arg(long, env = "KAFKA_CLUSTER")]
+    pub kafka_cluster: Option<String>,
+
+    #[arg(long, env = "KAFKA_ZONE")]
+    pub kafka_zone: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "latest",
+        value_parser = ["latest", "earliest"],
+        env = "KAFKA_AUTO_OFFSET_RESET"
+    )]
+    pub auto_offset_reset: String,
+
     #[arg(long, default_value_t = 12, env = "SEEK_HOURS")]
     pub seek_hours: u64,
 
@@ -98,6 +115,19 @@ impl Cli {
         }
         self.pipeline.default_topic()
     }
+
+    pub fn mtls_cluster(&self) -> anyhow::Result<&str> {
+        self.kafka_cluster
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--kafka-cluster is required with --kafka-auth=mtls"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KafkaAuthMode {
+    Scram,
+    Mtls,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
@@ -109,7 +139,6 @@ pub enum PipelineKind {
     Sid,
     #[value(name = "sid-tail")]
     SidTail,
-    MmMetadata,
     Ads,
     Analysis,
 }
@@ -119,7 +148,7 @@ impl PipelineKind {
         match self {
             Self::Main | Self::Sid => "phoenix_rank_all_indexing_event",
             Self::Topic => "phoenix_rank_all_indexing_event_backup",
-            Self::Metadata | Self::MmMetadata | Self::SidTail => "phoenix_rankall_metadata_event",
+            Self::Metadata | Self::SidTail => "phoenix_rankall_metadata_event",
             Self::Analysis => "home_mixer_phoenix_scored_candidates",
             Self::Ads => "",
         }
@@ -142,7 +171,13 @@ impl PipelineKind {
                 WindowConfig::new("post_creation", 24),
                 WindowConfig::new("1fav", 24),
                 WindowConfig::new("1fav", 48),
+                WindowConfig::new("1fav_video", 48),
+                WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
                 WindowConfig::new("32fav", 24),
+                WindowConfig::new("1fav_reply", 24),
+                WindowConfig::new("32fav_reply", 24),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
                 WindowConfig::new("video", 168),
@@ -152,7 +187,6 @@ impl PipelineKind {
                 WindowConfig::new("nsfw_video", 168),
                 WindowConfig::new("evergreen_video", 24 * 365 * 5),
                 WindowConfig::new("evergreen_nsfw_video", 24 * 365 * 5),
-                WindowConfig::new("evergreen_video_grok", 24 * 30),
             ],
             Self::Topic => vec![
                 WindowConfig::new("1fav", 24),
@@ -168,13 +202,13 @@ impl PipelineKind {
                 WindowConfig::new("metadata", 48),
                 WindowConfig::new("metadata", 72),
             ],
-            Self::MmMetadata => vec![
-                WindowConfig::new("mm_emb_metadata", 24),
-                WindowConfig::new("mm_emb_metadata_video", 48),
-                WindowConfig::new("mm_emb_metadata_video", 96),
-            ],
             Self::Sid => vec![
                 WindowConfig::new("1fav", 24),
+                WindowConfig::new("1fav_reply", 24),
+                WindowConfig::new("1fav_video", 48),
+                WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
                 WindowConfig::new("video", 24 * 14),
@@ -183,7 +217,8 @@ impl PipelineKind {
                 WindowConfig::new("nsfw_video", 24 * 14),
                 WindowConfig::new("evergreen_video", 24 * 365 * 5),
                 WindowConfig::new("imagine", 96),
-                WindowConfig::new("evergreen_video_grok", 24 * 30),
+                WindowConfig::bounded("video", 24 * 4, 24 * 14),
+                WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14),
             ],
             Self::SidTail => vec![WindowConfig::new("tail", 24)],
             Self::Analysis | Self::Ads => vec![],
@@ -197,7 +232,6 @@ impl fmt::Display for PipelineKind {
             Self::Main => write!(f, "main"),
             Self::Topic => write!(f, "topic"),
             Self::Metadata => write!(f, "metadata"),
-            Self::MmMetadata => write!(f, "mm_metadata"),
             Self::Ads => write!(f, "ads"),
             Self::Analysis => write!(f, "analysis"),
             Self::Sid => write!(f, "sid"),
@@ -210,6 +244,7 @@ impl fmt::Display for PipelineKind {
 pub struct WindowConfig {
     pub name: String,
     pub retention: Duration,
+    pub min_age: Option<Duration>,
 }
 
 impl WindowConfig {
@@ -217,12 +252,25 @@ impl WindowConfig {
         Self {
             name: name.into(),
             retention: Duration::from_secs(retention_hours * 3600),
+            min_age: None,
+        }
+    }
+
+    pub fn bounded(name: impl Into<String>, min_age_hours: u64, retention_hours: u64) -> Self {
+        assert!(min_age_hours < retention_hours);
+        Self {
+            name: name.into(),
+            retention: Duration::from_secs(retention_hours * 3600),
+            min_age: Some(Duration::from_secs(min_age_hours * 3600)),
         }
     }
 
     pub fn window_name(&self) -> String {
         let days = self.retention.as_secs() / 86400;
-        format!("{}_{days}day", self.name)
+        match self.min_age {
+            Some(min) => format!("{}_{}to{days}day", self.name, min.as_secs() / 86400),
+            None => format!("{}_{days}day", self.name),
+        }
     }
 }
 
@@ -240,8 +288,12 @@ mod tests {
             "evergreen_video_1825day"
         );
         assert_eq!(
-            WindowConfig::new("evergreen_video_grok", 24 * 30).window_name(),
-            "evergreen_video_grok_30day"
+            WindowConfig::bounded("video", 24 * 4, 24 * 14).window_name(),
+            "video_4to14day"
+        );
+        assert_eq!(
+            WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14).window_name(),
+            "nsfw_video_4to14day"
         );
     }
 
@@ -254,8 +306,11 @@ mod tests {
         assert!(names.contains(&"video_2day".to_string()));
         assert!(names.contains(&"post_creation_1day".to_string()));
         assert!(names.contains(&"evergreen_video_1825day".to_string()));
-        assert!(names.contains(&"evergreen_video_grok_30day".to_string()));
-        assert_eq!(configs.len(), 14);
+        assert!(names.contains(&"1fav_video_4to14day".to_string()));
+        assert!(names.contains(&"1fav_video_4to30day".to_string()));
+        assert!(names.contains(&"1fav_video_2day".to_string()));
+        assert!(names.contains(&"1fav_video_2to4day".to_string()));
+        assert_eq!(configs.len(), 19);
     }
 
     #[test]
@@ -321,7 +376,6 @@ mod tests {
         assert!(PipelineKind::Sid.is_implemented());
         assert!(PipelineKind::SidTail.is_implemented());
         assert!(PipelineKind::SidTail.needs_sid_endpoint());
-        assert!(!PipelineKind::MmMetadata.is_implemented());
         assert!(!PipelineKind::Ads.is_implemented());
     }
 
@@ -334,16 +388,26 @@ mod tests {
     }
 
     #[test]
-    fn sid_pipeline_includes_evergreen_video_grok_window() {
+    fn sid_pipeline_includes_bounded_4to14_windows() {
         let names: Vec<String> = PipelineKind::Sid
             .window_configs()
             .iter()
             .map(|w| w.window_name())
             .collect();
-        assert!(
-            names.contains(&"evergreen_video_grok_30day".to_string()),
-            "Sid window list missing evergreen_video_grok_30day: {names:?}",
-        );
+        for w in [
+            "video_4to14day",
+            "nsfw_video_4to14day",
+            "1fav_video_4to14day",
+            "1fav_video_4to30day",
+            "1fav_video_2day",
+            "1fav_video_2to4day",
+        ] {
+            assert!(
+                names.contains(&w.to_string()),
+                "Sid window list missing {w}: {names:?}",
+            );
+        }
+        assert!(!names.iter().any(|n| n.contains("evergreen_video_grok")));
     }
 
     #[test]
@@ -383,5 +447,59 @@ mod tests {
                 "unexpected imagine window {unexpected} in Sid list: {names:?}",
             );
         }
+    }
+
+    const BASE_ARGS: [&str; 7] = [
+        "xai-recsys-rankall",
+        "--pipeline",
+        "main",
+        "--group",
+        "g",
+        "--output-dir",
+        "/tmp/out",
+    ];
+
+    #[test]
+    fn kafka_auth_defaults_to_scram_on_main_2() {
+        let cli = Cli::try_parse_from(BASE_ARGS).unwrap();
+        assert_eq!(cli.kafka_auth, KafkaAuthMode::Scram);
+        assert_eq!(cli.bootstrap, "/s/kafka/main-2:kafka-tls");
+        assert_eq!(cli.auto_offset_reset, "latest");
+        assert!(cli.kafka_cluster.is_none());
+    }
+
+    #[test]
+    fn kafka_auth_mtls_takes_cluster_and_zone() {
+        let args = BASE_ARGS.iter().copied().chain([
+            "--kafka-auth",
+            "mtls",
+            "--kafka-cluster",
+            "phoenix",
+            "--kafka-zone",
+            "atla",
+            "--auto-offset-reset",
+            "earliest",
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.kafka_auth, KafkaAuthMode::Mtls);
+        assert_eq!(cli.mtls_cluster().unwrap(), "phoenix");
+        assert_eq!(cli.kafka_zone.as_deref(), Some("atla"));
+        assert_eq!(cli.auto_offset_reset, "earliest");
+    }
+
+    #[test]
+    fn kafka_auth_mtls_requires_cluster() {
+        let args = BASE_ARGS.iter().copied().chain(["--kafka-auth", "mtls"]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.mtls_cluster().is_err());
+    }
+
+    #[test]
+    fn auto_offset_reset_rejects_unknown_values() {
+        let args = BASE_ARGS
+            .iter()
+            .copied()
+            .chain(["--auto-offset-reset", "smallest"]);
+        assert!(Cli::try_parse_from(args).is_err());
     }
 }

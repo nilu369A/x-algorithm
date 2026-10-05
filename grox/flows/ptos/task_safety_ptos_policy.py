@@ -15,6 +15,7 @@ from grox.flows.ptos.state import (
 from grox.flows.ptos.classifier import (
     SafetyPtosChildSafetyPolicyClassifier,
     SafetyPtosPolicyClassifier,
+    SafetyPtosPolicyCrossValidator,
 )
 from grox.config.config import ModelName
 from grox.flows.ptos.mode import SafetyPtosMode
@@ -28,6 +29,7 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
     child_safety_classifier = SafetyPtosChildSafetyPolicyClassifier(
         gemma_model_name=GEMMA
     )
+    cross_validator = SafetyPtosPolicyCrossValidator()
 
     classifiers = {
         SafetyPtosMode.STANDARD: SafetyPtosPolicyClassifier(
@@ -79,27 +81,49 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
         violations = list(annotations.violatedPolicies or [])
 
         for violation in violations:
-            if (
-                violation.category == SafetyPolicyCategory.AdultContent
-                and await post_is_already_flagged_nsfw(ctx, post)
-            ):
-                Metrics.counter(
-                    f"{metric_prefix}.skipped_adult_content_already_nsfw.count"
-                ).add(1)
-                violation.safetyPolicy = SafetyPolicy(
-                    policyType=SafetyPolicyType.AdultContentSexualHard,
-                    reason="post was previously flagged nsfw by ptos",
-                )
-            elif violation.category == SafetyPolicyCategory.ChildSafety:
-                violation.safetyPolicy = (
-                    await cls.child_safety_classifier.classify_policy(post)
-                )
-            else:
-                violation.safetyPolicy = (
-                    await active_classifier.classify_policy_for_violation(
+            try:
+                if (
+                    violation.category == SafetyPolicyCategory.AdultContent
+                    and await post_is_already_flagged_nsfw(ctx, post)
+                ):
+                    Metrics.counter(
+                        f"{metric_prefix}.skipped_adult_content_already_nsfw.count"
+                    ).add(1)
+                    violation.safetyPolicy = SafetyPolicy(
+                        policyType=SafetyPolicyType.AdultContentSexualHard,
+                        reason="post was previously flagged nsfw by ptos",
+                    )
+                elif violation.category == SafetyPolicyCategory.ChildSafety:
+                    policy = await cls.child_safety_classifier.classify_policy(post)
+                    violation.safetyPolicy = await cls.cross_validator.validate(
+                        violation.category, post, policy
+                    )
+                elif violation.category in (
+                    SafetyPolicyCategory.ViolentMedia,
+                    SafetyPolicyCategory.IllegalAndRegulatedBehaviors,
+                ):
+                    policy = await active_classifier.classify_policy_for_violation(
                         post, violation
                     )
+                    violation.safetyPolicy = await cls.cross_validator.validate(
+                        violation.category, post, policy
+                    )
+                else:
+                    violation.safetyPolicy = (
+                        await active_classifier.classify_policy_for_violation(
+                            post, violation
+                        )
+                    )
+            except Exception as e:
+                Metrics.counter(f"{metric_prefix}.classify_error.count").add(
+                    1, attributes={"category": violation.category.value}
                 )
+                if not mode.graceful_classify_errors:
+                    raise
+                logger.warning(
+                    f"Post {post.id}: policy classification failed for {violation.category.value}, continuing: {e}"
+                )
+                continue
             if violation.safetyPolicy:
                 cls._record_policy_metrics(metric_prefix, violation)
 
@@ -135,13 +159,27 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
             reason="high-fav adult content recheck",
             score=50,
         )
-        policy = await active_classifier.classify_policy_for_violation(post, recheck)
+        try:
+            policy = await active_classifier.classify_policy_for_violation(
+                post, recheck
+            )
+        except Exception as e:
+            Metrics.counter(f"{metric_prefix}.classify_error.count").add(
+                1, attributes={"category": recheck.category.value}
+            )
+            logger.warning(
+                f"Post {post.id}: high-fav adult recheck failed, continuing: {e}"
+            )
+            return None
         if policy is None:
             return None
         recheck.safetyPolicy = policy
-        cls._record_policy_metrics(metric_prefix, recheck)
+        Metrics.counter(f"{metric_prefix}.high_fav_adult_recheck.count").add(
+            1, attributes={"policy_type": policy.policyType.name}
+        )
         if policy.policyType == SafetyPolicyType.NoViolation:
             return None
+        cls._record_policy_metrics(metric_prefix, recheck)
         return recheck
 
     @classmethod
@@ -158,6 +196,7 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
             SafetyPolicyCategory.ViolentSpeech: "violent_speech",
             SafetyPolicyCategory.SuicideOrSelfHarm: "suicide_or_self_harm",
             SafetyPolicyCategory.ChildSafety: "child_safety",
+            SafetyPolicyCategory.AgeGatingHarmfulText: "age_gating_harmful_text",
         }.get(violation.category)
         if category_key:
             Metrics.counter(
